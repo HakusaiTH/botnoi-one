@@ -4,3 +4,6 @@ config.local.h
 build/
 .vscode/
 .DS_Store
+*.mp3
+*.wav
+
