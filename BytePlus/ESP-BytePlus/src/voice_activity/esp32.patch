@@ -1,0 +1,301 @@
+--- a/webrtc/typedefs.h
++++ b/webrtc/typedefs.h
+@@ -42,6 +42,9 @@
+ #define WEBRTC_ARCH_32_BITS
+ #define WEBRTC_ARCH_LITTLE_ENDIAN
+ #elif defined(__MIPSEL__)
++#define WEBRTC_ARCH_32_BITS
++#define WEBRTC_ARCH_LITTLE_ENDIAN
++#elif defined(__XTENSA__)
+ #define WEBRTC_ARCH_32_BITS
+ #define WEBRTC_ARCH_LITTLE_ENDIAN
+ #elif defined(__pnacl__)
+--- a/webrtc/common_audio/vad/vad_core.c
++++ b/webrtc/common_audio/vad/vad_core.c
+@@ -8,13 +8,13 @@
+  *  be found in the AUTHORS file in the root of the source tree.
+  */
+ 
+-#include "webrtc/common_audio/vad/vad_core.h"
+-
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
+-#include "webrtc/common_audio/vad/vad_filterbank.h"
+-#include "webrtc/common_audio/vad/vad_gmm.h"
+-#include "webrtc/common_audio/vad/vad_sp.h"
+-#include "webrtc/typedefs.h"
++#include "vad_core.h"
++
++#include "../signal_processing/include/signal_processing_library.h"
++#include "vad_filterbank.h"
++#include "vad_gmm.h"
++#include "vad_sp.h"
++#include "../../typedefs.h"
+ 
+ // Spectrum Weighting
+ static const int16_t kSpectrumWeight[kNumChannels] = { 6, 8, 10, 12, 14, 16 };
+@@ -231,7 +231,7 @@
+           (int32_t) (log_likelihood_ratio * kSpectrumWeight[channel]);
+ 
+       // Local VAD decision.
+-      if ((log_likelihood_ratio << 2) > individualTest) {
++      if ((log_likelihood_ratio * 4) > individualTest) {
+         vadflag = 1;
+       }
+ 
+@@ -386,7 +386,8 @@
+ 
+           // (Q14 >> 2) * Q12 = Q24.
+           tmp_s16 = (ngprvec[gaussian] + 2) >> 2;
+-          tmp2_s32 = tmp_s16 * tmp1_s32;
++          // Preserve the upstream fixed-point wrap with defined arithmetic.
++          tmp2_s32 = (int32_t) ((uint32_t) tmp_s16 * (uint32_t) tmp1_s32);
+           // Q20  * approx 0.001 (2^-10=0.0009766), hence,
+           // (Q24 >> 14) = (Q24 >> 4) / 2^10 = Q20.
+           tmp1_s32 = tmp2_s32 >> 14;
+--- a/webrtc/common_audio/vad/vad_core.h
++++ b/webrtc/common_audio/vad/vad_core.h
+@@ -16,8 +16,8 @@
+ #ifndef WEBRTC_COMMON_AUDIO_VAD_VAD_CORE_H_
+ #define WEBRTC_COMMON_AUDIO_VAD_VAD_CORE_H_
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
+-#include "webrtc/typedefs.h"
++#include "../signal_processing/include/signal_processing_library.h"
++#include "../../typedefs.h"
+ 
+ enum { kNumChannels = 6 };  // Number of frequency bands (named channels).
+ enum { kNumGaussians = 2 };  // Number of Gaussians per channel in the GMM.
+--- a/webrtc/common_audio/vad/vad_filterbank.c
++++ b/webrtc/common_audio/vad/vad_filterbank.c
+@@ -8,12 +8,12 @@
+  *  be found in the AUTHORS file in the root of the source tree.
+  */
+ 
+-#include "webrtc/common_audio/vad/vad_filterbank.h"
++#include "vad_filterbank.h"
+ 
+ #include <assert.h>
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
+-#include "webrtc/typedefs.h"
++#include "../signal_processing/include/signal_processing_library.h"
++#include "../../typedefs.h"
+ 
+ // Constants used in LogOfEnergy().
+ static const int16_t kLogConst = 24660;  // 160*log10(2) in Q9.
+@@ -92,15 +92,15 @@
+   int i;
+   int16_t tmp16 = 0;
+   int32_t tmp32 = 0;
+-  int32_t state32 = ((int32_t) (*filter_state) << 16);  // Q15
++  int32_t state32 = (int32_t) (*filter_state) * 65536;  // Q15
+ 
+   for (i = 0; i < data_length; i++) {
+     tmp32 = state32 + WEBRTC_SPL_MUL_16_16(filter_coefficient, *data_in);
+     tmp16 = (int16_t) (tmp32 >> 16);  // Q(-1)
+     *data_out++ = tmp16;
+-    state32 = (((int32_t) (*data_in)) << 14); // Q14
++    state32 = (int32_t) (*data_in) * 16384; // Q14
+     state32 -= WEBRTC_SPL_MUL_16_16(filter_coefficient, tmp16);  // Q14
+-    state32 <<= 1;  // Q15.
++    state32 = (int32_t) ((uint32_t) state32 << 1);  // Q15, defined wrapping shift.
+     data_in += 2;
+   }
+ 
+--- a/webrtc/common_audio/vad/vad_filterbank.h
++++ b/webrtc/common_audio/vad/vad_filterbank.h
+@@ -15,8 +15,8 @@
+ #ifndef WEBRTC_COMMON_AUDIO_VAD_VAD_FILTERBANK_H_
+ #define WEBRTC_COMMON_AUDIO_VAD_VAD_FILTERBANK_H_
+ 
+-#include "webrtc/common_audio/vad/vad_core.h"
+-#include "webrtc/typedefs.h"
++#include "vad_core.h"
++#include "../../typedefs.h"
+ 
+ // Takes |data_length| samples of |data_in| and calculates the logarithm of the
+ // energy of each of the |kNumChannels| = 6 frequency bands used by the VAD:
+--- a/webrtc/common_audio/vad/vad_gmm.c
++++ b/webrtc/common_audio/vad/vad_gmm.c
+@@ -8,10 +8,10 @@
+  *  be found in the AUTHORS file in the root of the source tree.
+  */
+ 
+-#include "webrtc/common_audio/vad/vad_gmm.h"
++#include "vad_gmm.h"
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
+-#include "webrtc/typedefs.h"
++#include "../signal_processing/include/signal_processing_library.h"
++#include "../../typedefs.h"
+ 
+ static const int32_t kCompVar = 22005;
+ static const int16_t kLog2Exp = 5909;  // log2(exp(1)) in Q12.
+--- a/webrtc/common_audio/vad/vad_gmm.h
++++ b/webrtc/common_audio/vad/vad_gmm.h
+@@ -13,7 +13,7 @@
+ #ifndef WEBRTC_COMMON_AUDIO_VAD_VAD_GMM_H_
+ #define WEBRTC_COMMON_AUDIO_VAD_VAD_GMM_H_
+ 
+-#include "webrtc/typedefs.h"
++#include "../../typedefs.h"
+ 
+ // Calculates the probability for |input|, given that |input| comes from a
+ // normal distribution with mean and standard deviation (|mean|, |std|).
+--- a/webrtc/common_audio/vad/vad_sp.c
++++ b/webrtc/common_audio/vad/vad_sp.c
+@@ -8,13 +8,13 @@
+  *  be found in the AUTHORS file in the root of the source tree.
+  */
+ 
+-#include "webrtc/common_audio/vad/vad_sp.h"
++#include "vad_sp.h"
+ 
+ #include <assert.h>
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
+-#include "webrtc/common_audio/vad/vad_core.h"
+-#include "webrtc/typedefs.h"
++#include "../signal_processing/include/signal_processing_library.h"
++#include "vad_core.h"
++#include "../../typedefs.h"
+ 
+ // Allpass filter coefficients, upper and lower, in Q13.
+ // Upper: 0.64, Lower: 0.17.
+@@ -82,7 +82,7 @@
+       age[i]++;
+     } else {
+       // Too old value. Remove from memory and shift larger values downwards.
+-      for (j = i; j < 16; j++) {
++      for (j = i; j < 15; j++) {
+         smallest_values[j] = smallest_values[j + 1];
+         age[j] = age[j + 1];
+       }
+--- a/webrtc/common_audio/vad/vad_sp.h
++++ b/webrtc/common_audio/vad/vad_sp.h
+@@ -14,8 +14,8 @@
+ #ifndef WEBRTC_COMMON_AUDIO_VAD_VAD_SP_H_
+ #define WEBRTC_COMMON_AUDIO_VAD_VAD_SP_H_
+ 
+-#include "webrtc/common_audio/vad/vad_core.h"
+-#include "webrtc/typedefs.h"
++#include "vad_core.h"
++#include "../../typedefs.h"
+ 
+ // Downsamples the signal by a factor 2, eg. 32->16 or 16->8.
+ //
+--- a/webrtc/common_audio/signal_processing/division_operations.c
++++ b/webrtc/common_audio/signal_processing/division_operations.c
+@@ -21,7 +21,7 @@
+  *
+  */
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
++#include "include/signal_processing_library.h"
+ 
+ uint32_t WebRtcSpl_DivU32U16(uint32_t num, uint16_t den)
+ {
+--- a/webrtc/common_audio/signal_processing/energy.c
++++ b/webrtc/common_audio/signal_processing/energy.c
+@@ -15,7 +15,7 @@
+  *
+  */
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
++#include "include/signal_processing_library.h"
+ 
+ int32_t WebRtcSpl_Energy(int16_t* vector, int vector_length, int* scale_factor)
+ {
+--- a/webrtc/common_audio/signal_processing/get_scaling_square.c
++++ b/webrtc/common_audio/signal_processing/get_scaling_square.c
+@@ -15,7 +15,7 @@
+  *
+  */
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
++#include "include/signal_processing_library.h"
+ 
+ int16_t WebRtcSpl_GetScalingSquare(int16_t* in_vector,
+                                    int in_vector_length,
+--- a/webrtc/common_audio/signal_processing/resample_48khz.c
++++ b/webrtc/common_audio/signal_processing/resample_48khz.c
+@@ -16,8 +16,8 @@
+  */
+ 
+ #include <string.h>
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
+-#include "webrtc/common_audio/signal_processing/resample_by_2_internal.h"
++#include "include/signal_processing_library.h"
++#include "resample_by_2_internal.h"
+ 
+ ////////////////////////////
+ ///// 48 kHz -> 16 kHz /////
+--- a/webrtc/common_audio/signal_processing/resample_fractional.c
++++ b/webrtc/common_audio/signal_processing/resample_fractional.c
+@@ -15,7 +15,7 @@
+  *
+  */
+ 
+-#include "webrtc/common_audio/signal_processing/include/signal_processing_library.h"
++#include "include/signal_processing_library.h"
+ 
+ // interpolation coefficients
+ static const int16_t kCoefficients48To32[2][8] = {
+--- a/webrtc/common_audio/signal_processing/resample_by_2_internal.c
++++ b/webrtc/common_audio/signal_processing/resample_by_2_internal.c
+@@ -14,7 +14,7 @@
+  *
+  */
+ 
+-#include "webrtc/common_audio/signal_processing/resample_by_2_internal.h"
++#include "resample_by_2_internal.h"
+ 
+ // allpass filter coefficients.
+ static const int16_t kResampleAllpass[2][3] = {
+--- a/webrtc/common_audio/signal_processing/resample_by_2_internal.h
++++ b/webrtc/common_audio/signal_processing/resample_by_2_internal.h
+@@ -17,7 +17,7 @@
+ #ifndef WEBRTC_SPL_RESAMPLE_BY_2_INTERNAL_H_
+ #define WEBRTC_SPL_RESAMPLE_BY_2_INTERNAL_H_
+ 
+-#include "webrtc/typedefs.h"
++#include "../../typedefs.h"
+ 
+ /*******************************************************************
+  * resample_by_2_fast.c
+--- a/webrtc/common_audio/signal_processing/include/signal_processing_library.h
++++ b/webrtc/common_audio/signal_processing/include/signal_processing_library.h
+@@ -19,7 +19,7 @@
+ #define WEBRTC_SPL_SIGNAL_PROCESSING_LIBRARY_H_
+ 
+ #include <string.h>
+-#include "webrtc/typedefs.h"
++#include "../../../typedefs.h"
+ 
+ // Macros specific for the fixed point implementation
+ #define WEBRTC_SPL_WORD16_MAX       32767
+@@ -102,7 +102,7 @@
+   memcpy(v1, v2, (length) * sizeof(int16_t))
+ 
+ // inline functions:
+-#include "webrtc/common_audio/signal_processing/include/spl_inl.h"
++#include "spl_inl.h"
+ 
+ // Initialize SPL. Currently it contains only function pointer initialization.
+ // If the underlying platform is known to be ARM-Neon (WEBRTC_ARCH_ARM_NEON
+--- a/webrtc/common_audio/signal_processing/include/spl_inl.h
++++ b/webrtc/common_audio/signal_processing/include/spl_inl.h
+@@ -16,11 +16,11 @@
+ #define WEBRTC_SPL_SPL_INL_H_
+ 
+ #ifdef WEBRTC_ARCH_ARM_V7
+-#include "webrtc/common_audio/signal_processing/include/spl_inl_armv7.h"
++#include "spl_inl_armv7.h"
+ #else
+ 
+ #if defined(MIPS32_LE)
+-#include "webrtc/common_audio/signal_processing/include/spl_inl_mips.h"
++#include "spl_inl_mips.h"
+ #endif
+ 
+ #if !defined(MIPS_DSP_R1_LE)

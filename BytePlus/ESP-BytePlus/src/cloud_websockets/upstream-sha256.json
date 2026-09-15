@@ -1,0 +1,13 @@
+{
+  "WebSocketsClient.cpp": "81c6900bf87414bdd63dee8ef5954af960b2fed70a162d48d4e99eefa959ae82",
+  "WebSocketsClient.h": "017becff249babf053bb69049ac961c70d1916ad33937ac1d78af0175259945b",
+  "WebSockets.cpp": "6fa7b92afb9ca87d0eb6e6cc8c2d777076a36776d888738152ad7a0e66cfae9f",
+  "WebSockets.h": "99447004878caf123010eb7e4453f0f7c35ecaac1d5ebfc6b0a875f8103af665",
+  "WebSocketsVersion.h": "f73f841008a1993372bc954743cf0d857728bb69064cdc15a2ebe9427d1fe500",
+  "libb64/cencode.c": "bb661a4624ddab3614637974ca42a38db1f26b3cf347be2d2f5fbd8c4bb56f1f",
+  "libb64/cdecode.c": "3a0c99e77a0216ad76941067a177ef8bcce4f9a53da8273dfda053099960e89d",
+  "libb64/cencode_inc.h": "dac79adf26058ba4ea32af75dc214c7c73ef1504746b8a1f0cac9ec691275213",
+  "libb64/cdecode_inc.h": "1d2e227f326d9d8fcefb40270aecf45e3e7edd9e18e6325ecd513d3514bddbf2",
+  "libb64/AUTHORS": "a876cb336b273ecc6c7089abf52c8f739183dcfae495f5dc4ef7f75341563af5",
+  "libb64/LICENSE": "834b7afa1b3c40289a3be775d3625016be1c0d7ea7a4a26c1eb207f53dc961d8"
+}

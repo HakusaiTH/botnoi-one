@@ -1,0 +1,6 @@
+.env
+*.env
+config.local.h
+build/
+.vscode/
+.DS_Store
