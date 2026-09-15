@@ -14,7 +14,6 @@
 #include "tts_protocol.h"
 #include "cloud_socket.h"
 #include "tls_roots.h"
-#include "voice_display.h"
 #include "voice_activity.h"
 #include "conversation_session.h"
 #include "model_stream.h"
@@ -108,9 +107,6 @@ void captureTask(void*) {
     preRollNext = preRollCount = 0;
     awaitingAnnounced = detectorWasActive = false;
     voiceDetector.reset();
-    if (error) voice_display::setError(error, stoppedTurn);
-    else voice_display::setState(timedOut ? voice_display::State::TimedOut : voice_display::State::Ready,
-                                 stoppedTurn);
     Serial.println(timedOut ? "[SESSION] OFF: no speech for 30 seconds. Tap to restart."
                            : "[SESSION] OFF: tap to start a new conversation.");
   };
@@ -200,8 +196,6 @@ void captureTask(void*) {
       voiceDetector.reset();
       detectorWasActive = false;
       awaitingAnnounced = canStart;
-      voice_display::setState(canStart ? voice_display::State::AwaitingSpeech
-                                      : voice_display::State::StartingSession, startedTurn);
       Serial.println("[SESSION] ON: speak naturally; tap again to stop. Silence timeout: 30 seconds.");
     }
     if (!result.enabled) continue;
@@ -222,7 +216,6 @@ void captureTask(void*) {
         queued = xQueueSend(micQueue, &buffered, 0) == pdTRUE;
       }
       preRollNext = preRollCount = 0;
-      voice_display::setState(voice_display::State::Listening, turn);
       // Publish only after pre-roll is queued; this also reserves the pipeline.
       if (queued) requestedTurn.store(turn);
       Serial.println("[MIC] Speech detected; recording until a pause.");
@@ -236,7 +229,6 @@ void captureTask(void*) {
       continue;
     }
     if (result.has(Action::EndUtterance)) {
-      voice_display::setState(voice_display::State::Recognizing, turn);
       utteranceEndedAt.store(now);
       recordingEnded.store(turn);  // The final PCM frame is already queued.
       Serial.printf("[MIC] Endpoint (%s) after %lu ms; silence=%lu ms voiced=%lu/%lu short=%lu max_gap=%lu ms.\n",
@@ -246,7 +238,6 @@ void captureTask(void*) {
           static_cast<unsigned long>(voicedFrames), static_cast<unsigned long>(vadFrames),
           static_cast<unsigned long>(shortReads), static_cast<unsigned long>(maxFrameGap));
     } else if (result.listening && !result.utteranceActive && !awaitingAnnounced) {
-      voice_display::setState(voice_display::State::AwaitingSpeech, generation.load());
       awaitingAnnounced = true;
       Serial.println("[SESSION] Listening for the next utterance.");
     }
@@ -495,7 +486,6 @@ class TtsStream {
       } else if (response.event == 352 && stage_ == 2) {
         if (response.type != 11 || response.serialization != 0) { failed_ = true; return; }
         if (!audioBytes_ && response.payloadLength) {
-          voice_display::setState(voice_display::State::Speaking, turn_);
           Serial.printf("[LATENCY] First TTS PCM %lu ms after endpoint; %lu ms since last detected speech.\n",
               static_cast<unsigned long>(millis() - utteranceEndedAt.load()),
               static_cast<unsigned long>(millis() - lastSpeechAt.load()));
@@ -675,7 +665,6 @@ bool streamReply(const String& transcript, uint32_t turn, String& answer, FaultR
           static_cast<unsigned long>(millis() - utteranceEndedAt.load()));
     }
     if (!state.answer->concat(delta, size)) return false;
-    voice_display::setReplyText(state.answer->c_str(), state.turn);
     return modelChunks.feed(delta, size, callbacks.text, &state);
   };
   struct EventSink {
@@ -725,11 +714,9 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\nStandalone BytePlus ESP32 voicebot");
-  if (!voice_display::begin()) Serial.println("[TFT] Display task unavailable; voice operation continues.");
   if (!strlen(WIFI_SSID) || !strlen(BYTEPLUS_ASR_APP_ID) || !strlen(BYTEPLUS_ASR_ACCESS_TOKEN) ||
       !strlen(BYTEPLUS_TTS_APP_ID) || !strlen(BYTEPLUS_TTS_TOKEN) || !strlen(BYTEPLUS_ARK_API_KEY) || !strlen(BYTEPLUS_ARK_ENDPOINT_ID)) {
     Serial.println("[CONFIG] Fill config.local.h, then upload again.");
-    voice_display::setError("Wi-Fi or BytePlus settings missing.");
     return;
   }
   pinMode(BUTTON_TALK, INPUT_PULLUP);
@@ -740,31 +727,26 @@ void setup() {
   if (!microphone.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT) ||
       !speaker.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
     Serial.println("[I2S] Initialization failed; check board and pins.");
-    voice_display::setError("Audio setup failed. Check I2S wiring.");
     return;
   }
   if (!voiceDetector.begin()) {
     Serial.println("[VAD] Speech detector initialization failed.");
-    voice_display::setError("Speech detector could not start.");
     return;
   }
   micQueue = makeAudioQueue(MIC_QUEUE_FRAMES, &micQueueState);
   spkQueue = makeAudioQueue(SPK_QUEUE_FRAMES, &spkQueueState);
   if (!micQueue || !spkQueue) {
     Serial.println("[MEMORY] Audio queues could not be allocated; enable PSRAM if available.");
-    voice_display::setError("Audio memory unavailable. Enable OPI PSRAM.");
     return;
   }
   if (xTaskCreate(captureTask, "mic", 8192, nullptr, 2, nullptr) != pdPASS ||
       xTaskCreate(playbackTask, "speaker", 6144, nullptr, 2, nullptr) != pdPASS) {
     Serial.println("[MEMORY] Audio tasks could not start.");
-    voice_display::setError("Audio tasks could not start.");
     return;
   }
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  voice_display::setState(voice_display::State::Connecting);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   ready = true;
@@ -777,8 +759,6 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED || time(nullptr) < 1700000000) {
     networkReady.store(false);
     announcedReady = false;
-    voice_display::setState(WiFi.status() == WL_CONNECTED
-        ? voice_display::State::SyncingClock : voice_display::State::Connecting);
     if (millis() - lastNotice > 5000) {
       Serial.println("[WAIT] Waiting for Wi-Fi and clock synchronization for verified TLS.");
       lastNotice = millis();
@@ -788,7 +768,6 @@ void loop() {
   }
   if (!announcedReady) {
     Serial.println("[READY] Wi-Fi and clock synchronized. Tap to start a conversation.");
-    voice_display::setState(voice_display::State::Ready, generation.load());
     announcedReady = true;
   }
   networkReady.store(true);
@@ -819,13 +798,10 @@ void loop() {
   String reply;
   if (transcript.length() && active(turn)) {
     Serial.printf("[USER] %s\n", transcript.c_str());
-    voice_display::setUserText(transcript.c_str(), turn);
-    voice_display::setState(voice_display::State::Thinking, turn);
     failure = FaultReason::Model;
     completed = streamReply(transcript, turn, reply, failure);
     if (completed && active(turn)) {
       Serial.printf("[BOT] %s\n", reply.c_str());
-      voice_display::setReplyText(reply.c_str(), turn);
     }
   }
   cloud.close();

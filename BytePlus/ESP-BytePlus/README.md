@@ -34,12 +34,6 @@ ESP32 เป็นผู้เรียกทั้งสามบริกา�
 
 | อุปกรณ์ | ขาอุปกรณ์ | ESP32-S3 GPIO | หมายเหตุ |
 | --- | --- | ---: | --- |
-| ST7735 TFT | SCK | **GPIO42** | Hardware SPI Clock |
-| ST7735 TFT | MOSI | **GPIO41** | Hardware SPI Data |
-| ST7735 TFT | DC | **GPIO45** | Data / Command |
-| ST7735 TFT | CS | **GPIO47** | Chip Select |
-| ST7735 TFT | RESET | **GPIO14** | Reset |
-| ST7735 TFT | LED/BL | **GPIO21** | Backlight |
 | INMP441 | BCLK / SCK | **GPIO3** | Microphone Bit Clock |
 | INMP441 | WS / LRCLK | **GPIO2** | Word Select / Frame Sync |
 | INMP441 | DOUT / SD | **GPIO1** | Data Out |
@@ -73,18 +67,10 @@ ESP32 เป็นผู้เรียกทั้งสามบริกา�
 ## Build และ upload ด้วย Arduino IDE
 
 1. เพิ่ม `https://espressif.github.io/arduino-esp32/package_esp32_index.json` ใน Additional Boards Manager URLs แล้วติดตั้ง **esp32 by Espressif Systems 3.3.11** จาก Boards Manager
-2. ติดตั้ง **ArduinoJson 7.4.3**, **Adafruit ST7735 and ST7789 Library 1.11.0**, **Adafruit GFX Library 1.12.6**, **Adafruit BusIO 1.17.4** และ **U8g2_for_Adafruit_GFX 1.8.0** จาก Library Manager
+2. ติดตั้ง **ArduinoJson 7.4.3** จาก Library Manager
 3. เลือก **ESP32-S3 Dev Module** สำหรับบอร์ด N16R8 ที่ทดสอบให้เลือก **Flash Size: 16 MB**, **PSRAM: OPI PSRAM**, **USB CDC On Boot: Disabled** และใช้ partition scheme เริ่มต้น
 4. ต่อพอร์ต USB-to-UART เลือก serial port ของบอร์ด แล้วกด **Upload**
 5. เมื่อต้องการอ่าน log ให้เปิด Serial Monitor ที่ **115200 baud** หลังแฟลชเสร็จสามารถถอดคอมพิวเตอร์แล้วเปลี่ยนเป็นอะแดปเตอร์ USB หรือ power bank ได้
-
-ซอร์ส arduinoWebSockets **2.7.2** อยู่ใน `src/cloud_websockets/` แล้ว จึงไม่ต้องติดตั้ง WebSockets เพิ่ม สำเนานี้ปรับขอบเขตข้อความเป็น **64 KiB** และจำกัดเวลารอ เพราะ TTS ที่ทดสอบจริงส่ง audio chunk ใหญ่กว่า 15 KiB ดูที่มา ใบอนุญาต และรายละเอียด patch ใน [vendored client](src/cloud_websockets/README.md)
-
-## จอ TFT ST7735
-
-จอขนาด **128×160 แนวตั้ง** แสดงสถานะเชื่อมต่อ Wi-Fi, ซิงก์เวลา, พร้อมพูด, กำลังฟัง, รู้จำเสียง, คิดคำตอบ และเล่นเสียง พร้อมข้อความสนทนาภาษาไทยหรืออังกฤษ ข้อความยาวเปลี่ยนหน้าอัตโนมัติ และคำตอบล่าสุดยังอยู่บนจอเมื่อจบรอบ
-
-จอใช้ hardware SPI ตามขาในตาราง และ task ลำดับความสำคัญต่ำแยกจากงานเสียง การส่งสถานะจากงานเสียงไม่รอให้วาดจอเสร็จ ค่าเริ่มต้นใช้ ST7735 black-tab, rotation 0 และ SPI 16 MHz ปรับชนิด panel, rotation และขาได้ใน [voice_display.h](voice_display.h) ส่วนไฟ backlight ใช้การต่อเดิมของโมดูล ไม่มีการกำหนด GPIO ควบคุม backlight
 
 ## พฤติกรรมและการแก้ปัญหา
 
