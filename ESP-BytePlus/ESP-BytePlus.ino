@@ -34,7 +34,7 @@ constexpr size_t PRE_ROLL_FRAMES = 12, HISTORY_TURNS = 4;
 static_assert(FRAME_BYTES == VoiceActivity::kFrameSamples * sizeof(int16_t) &&
               SAMPLE_RATE == VoiceActivity::kSampleRate, "VAD requires 20 ms PCM16 at 16 kHz");
 constexpr char VOICE_HOST[] = "voice.ap-southeast-1.bytepluses.com";
-constexpr char ARK_URL[] = "https://ark.ap-southeast.bytepluses.com/api/v3/chat/completions";
+constexpr char ARK_URL[] = "http://ark.ap-southeast.bytepluses.com/api/v3/chat/completions";
 
 struct AudioFrame {
   uint32_t generation;
@@ -292,7 +292,8 @@ bool enqueueSpeech(const uint8_t* pcm, size_t length, uint32_t turn) {
   return length == 0;
 }
 
-String recognize(uint32_t turn) {
+String recognize(uint32_t turn, bool& asrSuccess) {
+  asrSuccess = false;
   if (!active(turn)) return "";
   String headers = String("X-Api-App-Key: ") + BYTEPLUS_ASR_APP_ID + "\r\nX-Api-Access-Key: " +
       BYTEPLUS_ASR_ACCESS_TOKEN + "\r\nX-Api-Resource-Id: volc.bigasr.sauc.duration\r\nX-Api-Request-Id: " + uuid() + "\r\n";
@@ -398,6 +399,7 @@ String recognize(uint32_t turn) {
   if (!active(turn) || failed || !finalSent || !finalReceived) return "";
   Serial.printf("[LATENCY] ASR final received %lu ms after endpoint.\n",
       static_cast<unsigned long>(millis() - utteranceEndedAt.load()));
+  asrSuccess = true;
   return transcript;
 }
 
@@ -411,18 +413,34 @@ bool sendEvent(uint32_t event, const String& session, const String& json) {
 // this task; microphone/button and I2S playback continue in their own tasks.
 class TtsStream {
  public:
-  bool begin(uint32_t turn) {
+  void prepare(uint32_t turn) {
     turn_ = turn;
     session_ = uuid();
     failed_ = finished_ = finishing_ = false;
     stage_ = 0;
     audioBytes_ = 0;
+    started_ = lastResponse_ = 0;
+  }
+
+  bool begin(uint32_t turn) {
+    turn_ = turn;
+    if (!session_.length()) session_ = uuid();
+    failed_ = finished_ = finishing_ = false;
+    stage_ = 0;
+    audioBytes_ = 0;
     started_ = lastResponse_ = millis();
-    if (!active(turn_)) return false;
+    if (!active(turn_)) {
+      Serial.println("[TTS] begin failed: session active check failed");
+      return false;
+    }
     String headers = String("X-Api-App-Key: ") + BYTEPLUS_TTS_APP_ID + "\r\nX-Api-Access-Key: " +
         BYTEPLUS_TTS_TOKEN + "\r\nX-Api-Resource-Id: " + BYTEPLUS_TTS_RESOURCE_ID +
         "\r\nX-Api-Connect-Id: " + uuid() + "\r\n";
-    if (!cloud.connect(VOICE_HOST, "/api/v3/tts/bidirection", headers, BYTEPLUS_ROOT_CA)) return false;
+    Serial.println("[TTS] Connecting to TTS server...");
+    if (!cloud.connect(VOICE_HOST, "/api/v3/tts/bidirection", headers, BYTEPLUS_ROOT_CA)) {
+      Serial.printf("[TTS] cloud.connect failed: %s\n", cloud.lastError());
+      return false;
+    }
     request_.clear();
     request_["user"]["uid"] = "esp32-voicebot";
     request_["namespace"] = "BidirectionalTTS";
@@ -433,19 +451,40 @@ class TtsStream {
     String startJson;
     serializeJson(request_, startJson);
     startJson_ = startJson;
-    if (!active(turn_) || !sendEvent(1, "", "{}")) return false;
+    Serial.println("[TTS] Sending event 1 (StartConnection)...");
+    if (!active(turn_) || !sendEvent(1, "", "{}")) {
+      Serial.printf("[TTS] sendEvent 1 failed, lastError: %s\n", cloud.lastError());
+      return false;
+    }
+    Serial.println("[TTS] Waiting for session handshake (events 50 & 150)...");
     while (active(turn_) && stage_ < 2 && pump()) delay(1);
-    return active(turn_) && !failed_ && stage_ == 2;
+    if (!active(turn_) || failed_ || stage_ != 2) {
+      Serial.printf("[TTS] begin incomplete: active=%d failed=%d stage=%u error=%s\n",
+          active(turn_), failed_, stage_, cloud.lastError());
+      return false;
+    }
+    return true;
   }
 
-  bool text(const char* value, size_t length) {
-    if (!active(turn_) || failed_ || finished_ || finishing_ || stage_ != 2) return false;
+  bool text(const char* value, size_t length, uint32_t turn) {
     if (!length) return true;
+    if (stage_ == 0) {
+      if (!begin(turn)) {
+        Serial.println("[TTS] Lazy begin failed in text()");
+        return false;
+      }
+    }
+    if (!active(turn_) || failed_ || finished_ || finishing_ || stage_ != 2) {
+      Serial.printf("[TTS] text() rejected: active=%d failed=%d finished=%d finishing=%d stage=%u\n",
+          active(turn_), failed_, finished_, finishing_, stage_);
+      return false;
+    }
     request_["event"] = 200;
     request_["req_params"]["text"] = String(value, length);
     String json;
     serializeJson(request_, json);
     if (!active(turn_) || !sendEvent(200, session_, json)) {
+      Serial.printf("[TTS] sendEvent 200 failed: %s\n", cloud.lastError());
       failed_ = true;
       return false;
     }
@@ -453,61 +492,107 @@ class TtsStream {
   }
 
   bool finishText() {
+    if (stage_ == 0) return true;
     if (!active(turn_) || failed_ || finishing_ || stage_ != 2) return false;
     finishing_ = true;
     return sendEvent(102, session_, "{}");
   }
 
   bool pump() {
-    if (!active(turn_) || failed_) return false;
+    if (turn_ && !active(turn_)) return false;
+    if (failed_) return false;
+    if (stage_ == 0) return true;
     if (finished_) return true;
     if (millis() - started_ > 60000 || millis() - lastResponse_ > 15000) {
+      Serial.println("[TTS] Timeout waiting for server response");
       failed_ = true;
       return false;
     }
-    cloud.poll([&](const uint8_t* data, size_t length) {
-      if (!active(turn_)) { failed_ = true; return; }
-      byteplus::tts::Frame response;
-      if (!byteplus::tts::parse(data, length, response) || response.compression != 0 || response.type == 15) {
-        failed_ = true;
-        return;
-      }
-      lastResponse_ = millis();
-      if (response.event >= 100 &&
-          (response.sessionIdLength != session_.length() || memcmp(response.sessionId, session_.c_str(), session_.length()))) {
-        failed_ = true;
-        return;
-      }
-      if (response.event == 50 && stage_ == 0) {
-        stage_ = 1;
-        if (!sendEvent(100, session_, startJson_)) failed_ = true;
-      } else if (response.event == 150 && stage_ == 1) {
-        stage_ = 2;
-      } else if (response.event == 352 && stage_ == 2) {
-        if (response.type != 11 || response.serialization != 0) { failed_ = true; return; }
-        if (!audioBytes_ && response.payloadLength) {
-          Serial.printf("[LATENCY] First TTS PCM %lu ms after endpoint; %lu ms since last detected speech.\n",
-              static_cast<unsigned long>(millis() - utteranceEndedAt.load()),
-              static_cast<unsigned long>(millis() - lastSpeechAt.load()));
+    if (cloud.connected()) {
+      cloud.poll([&](const uint8_t* data, size_t length) {
+        if (!active(turn_)) { failed_ = true; return; }
+        byteplus::tts::Frame response;
+        if (!byteplus::tts::parse(data, length, response)) {
+          Serial.printf("[TTS] Parse failed (len=%u, data[0]=0x%02X)\n",
+              static_cast<unsigned>(length), length ? data[0] : 0);
+          failed_ = true;
+          return;
         }
-        if (!enqueueSpeech(response.payload, response.payloadLength, turn_)) failed_ = true;
-        audioBytes_ += response.payloadLength;
-      } else if (response.event == 152 && stage_ == 2) {
-        if (!finishing_) failed_ = true;
-        else finished_ = true;
-      } else if (response.event == 51 || response.event == 153 || response.event == 151) {
-        failed_ = true;
-      }
-    });
-    if (!cloud.connected() && !finished_) failed_ = true;
+        if (response.type == 15 || response.event == 51 || response.event == 153 || response.event == 151) {
+          Serial.printf("[TTS] Server error event=%u type=%u err=%u payload: %.*s\n",
+              response.event, response.type, response.errorCode,
+              static_cast<int>(min(response.payloadLength, (size_t)256)),
+              reinterpret_cast<const char*>(response.payload));
+          failed_ = true;
+          return;
+        }
+        if (response.compression != 0) {
+          Serial.printf("[TTS] Compression %u not supported (event=%u)\n", response.compression, response.event);
+          failed_ = true;
+          return;
+        }
+        lastResponse_ = millis();
+        if (response.event >= 100 &&
+            (response.sessionIdLength != session_.length() || memcmp(response.sessionId, session_.c_str(), session_.length()))) {
+          Serial.printf("[TTS] Session ID mismatch\n");
+          failed_ = true;
+          return;
+        }
+        if (response.event == 50 && stage_ == 0) {
+          Serial.println("[TTS] Received event 50 (ConnectionStarted), sending event 100...");
+          stage_ = 1;
+          if (!sendEvent(100, session_, startJson_)) {
+            Serial.println("[TTS] Failed to send event 100");
+            failed_ = true;
+          }
+        } else if (response.event == 150 && stage_ == 1) {
+          Serial.println("[TTS] Received event 150 (SessionStarted)");
+          stage_ = 2;
+        } else if (response.event == 352 && stage_ == 2) {
+          if (response.type != 11 || response.serialization != 0) {
+            Serial.printf("[TTS] Invalid audio frame type=%u ser=%u\n", response.type, response.serialization);
+            failed_ = true;
+            return;
+          }
+          if (!audioBytes_ && response.payloadLength) {
+            Serial.printf("[LATENCY] First TTS PCM %lu ms after endpoint; %lu ms since last detected speech.\n",
+                static_cast<unsigned long>(millis() - utteranceEndedAt.load()),
+                static_cast<unsigned long>(millis() - lastSpeechAt.load()));
+          }
+          if (!enqueueSpeech(response.payload, response.payloadLength, turn_)) {
+            Serial.println("[TTS] enqueueSpeech failed");
+            failed_ = true;
+          }
+          audioBytes_ += response.payloadLength;
+        } else if (response.event == 152 && stage_ == 2) {
+          Serial.println("[TTS] Received event 152 (SessionFinished)");
+          if (!finishing_) {
+            Serial.println("[TTS] Session finished prematurely by server");
+            failed_ = true;
+          } else finished_ = true;
+        } else {
+          Serial.printf("[TTS] Received event %u (stage=%u, len=%u)\n",
+              response.event, stage_, static_cast<unsigned>(response.payloadLength));
+        }
+      });
+    } else if (stage_ > 0 && !finished_) {
+      Serial.println("[TTS] Cloud socket disconnected before finish");
+      failed_ = true;
+    }
     return !failed_ && active(turn_);
   }
 
   bool drain() {
+    if (stage_ == 0) {
+      Serial.println("[TTS] drain called but stage is 0");
+      return true;
+    }
+    Serial.println("[TTS] Draining audio stream...");
     while (!finished_ && pump()) delay(1);
     const uint32_t drainStarted = millis();
     while (active(turn_) && !failed_ && pendingAudio.load() && millis() - drainStarted < 5000) delay(5);
-    Serial.printf("[TTS] Received %u PCM bytes.\n", static_cast<unsigned>(audioBytes_));
+    Serial.printf("[TTS] Received %u PCM bytes. pendingAudio=%u\n",
+        static_cast<unsigned>(audioBytes_), static_cast<unsigned>(pendingAudio.load()));
     return active(turn_) && !failed_ && finished_ && audioBytes_ && !pendingAudio.load();
   }
 
@@ -557,23 +642,28 @@ void rememberReply(const String& transcript, const String& reply) {
 }
 
 bool streamReply(const String& transcript, uint32_t turn, String& answer, FaultReason& failure) {
-  if (!active(turn)) return false;
-  failure = FaultReason::Tts;
-  if (!tts.begin(turn)) { tts.close(); return false; }
+  if (!active(turn)) {
+    Serial.println("[LLM] turn inactive at start of streamReply");
+    return false;
+  }
+  tts.prepare(turn);
   failure = FaultReason::Model;
   Serial.println("[LLM] Streaming answer into TTS...");
-  WiFiClientSecure client;
-  client.setCACert(BYTEPLUS_ROOT_CA);
-  client.setHandshakeTimeout(10);
+  WiFiClient client;
   HTTPClient http;
-  http.setConnectTimeout(8000);
+  http.setConnectTimeout(10000);
   http.setTimeout(15000);
   http.setReuse(false);
-  if (!http.begin(client, ARK_URL)) { tts.close(); return false; }
+  if (!http.begin(client, ARK_URL)) {
+    Serial.println("[LLM] http.begin failed");
+    tts.close();
+    return false;
+  }
   const char* responseHeaders[] = {"Transfer-Encoding", "Content-Type", "Content-Length", "Content-Encoding"};
   http.collectHeaders(responseHeaders, 4);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Accept", "text/event-stream");
+  http.addHeader("Accept-Encoding", "identity");
   http.addHeader("Authorization", String("Bearer ") + BYTEPLUS_ARK_API_KEY);
   JsonDocument request;
   request["model"] = BYTEPLUS_ARK_ENDPOINT_ID;
@@ -599,10 +689,16 @@ bool streamReply(const String& transcript, uint32_t turn, String& answer, FaultR
   user["content"] = transcript;
   String body;
   serializeJson(request, body);
-  if (!active(turn)) { http.end(); tts.close(); return false; }
+  if (!active(turn)) {
+    Serial.println("[LLM] turn inactive before http.POST");
+    http.end(); tts.close(); return false;
+  }
   int status = http.POST(body);
   if (status != HTTP_CODE_OK || !http.header("Content-Type").startsWith("text/event-stream")) {
-    Serial.printf("[LLM] HTTP status %d\n", status);
+    Serial.printf("[LLM] HTTP status %d (%s), Content-Type: '%s', free DRAM: %u bytes\n",
+        status, http.errorToString(status).c_str(),
+        http.header("Content-Type").c_str(),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
     http.end();
     tts.close();
     return false;
@@ -611,11 +707,14 @@ bool streamReply(const String& transcript, uint32_t turn, String& answer, FaultR
   const String encoding = http.header("Transfer-Encoding");
   if ((encoding.length() && (!encoding.equalsIgnoreCase("chunked") || http.hasHeader("Content-Length"))) ||
       (http.hasHeader("Content-Encoding") && !http.header("Content-Encoding").equalsIgnoreCase("identity"))) {
+    Serial.printf("[LLM] Header mismatch: Transfer-Encoding='%s', Content-Length=%d, Content-Encoding='%s'\n",
+        encoding.c_str(), http.hasHeader("Content-Length"), http.header("Content-Encoding").c_str());
     http.end(); tts.close(); return false;
   }
   if (!modelBody.reset(encoding.length() ? BodyMode::Chunked :
       (http.getSize() >= 0 ? BodyMode::ContentLength : BodyMode::UntilClose),
       http.getSize() >= 0 ? static_cast<uint32_t>(http.getSize()) : 0)) {
+    Serial.println("[LLM] modelBody.reset failed");
     http.end(); tts.close(); return false;
   }
   modelEvents.reset();
@@ -630,8 +729,15 @@ bool streamReply(const String& transcript, uint32_t turn, String& answer, FaultR
   context.lastTextFlush = millis();
   auto textSink = +[](const char* text, size_t length, void* opaque) -> bool {
     auto& state = *static_cast<Context*>(opaque);
-    if (!active(state.turn)) return false;
-    if (!tts.text(text, length)) { *state.failure = FaultReason::Tts; return false; }
+    if (!active(state.turn)) {
+      Serial.println("[LLM] textSink rejected: turn inactive");
+      return false;
+    }
+    if (!tts.text(text, length, state.turn)) {
+      Serial.println("[LLM] textSink rejected: tts.text failed");
+      *state.failure = FaultReason::Tts;
+      return false;
+    }
     state.lastTextFlush = millis();
     return true;
   };
@@ -646,25 +752,43 @@ bool streamReply(const String& transcript, uint32_t turn, String& answer, FaultR
     if (!active(state.turn) || state.done) return false;
     if (length == 6 && memcmp(event, "[DONE]", 6) == 0) {
       state.done = state.finishSeen;
+      if (!state.done) Serial.println("[LLM] SSE [DONE] received before finishSeen");
       return state.done;
     }
     JsonDocument result;
-    if (deserializeJson(result, event, length) || !result["error"].isNull()) return false;
+    DeserializationError err = deserializeJson(result, event, length);
+    if (err) {
+      Serial.printf("[LLM] SSE JSON parse error: %s (len=%u)\n", err.c_str(), static_cast<unsigned>(length));
+      return false;
+    }
+    if (!result["error"].isNull()) {
+      Serial.printf("[LLM] Model error returned: %s\n", result["error"]["message"] | "unknown");
+      return false;
+    }
     const auto choice = result["choices"][0];
     const char* finish = choice["finish_reason"] | "";
     if (*finish) {
-      if (strcmp(finish, "stop") && strcmp(finish, "length")) return false;
+      if (strcmp(finish, "stop") && strcmp(finish, "length")) {
+        Serial.printf("[LLM] Unknown finish_reason: %s\n", finish);
+        return false;
+      }
       state.finishSeen = true;
     }
     const char* delta = choice["delta"]["content"] | "";
     const size_t size = strlen(delta);
     if (!size) return true;
-    if (size > 2048 - state.answer->length()) return false;
+    if (size > 2048 - state.answer->length()) {
+      Serial.println("[LLM] Answer length exceeded 2048 bytes");
+      return false;
+    }
     if (!state.answer->length()) {
       Serial.printf("[LATENCY] First model text %lu ms after endpoint.\n",
           static_cast<unsigned long>(millis() - utteranceEndedAt.load()));
     }
-    if (!state.answer->concat(delta, size)) return false;
+    if (!state.answer->concat(delta, size)) {
+      Serial.println("[LLM] String concat failed (out of memory)");
+      return false;
+    }
     return modelChunks.feed(delta, size, callbacks.text, &state);
   };
   struct EventSink {
@@ -676,35 +800,58 @@ bool streamReply(const String& transcript, uint32_t turn, String& answer, FaultR
     return modelEvents.feed(bytes, length, callbacks.event, callbacks.sinks);
   };
   auto* stream = http.getStreamPtr();
-  if (!stream) { http.end(); tts.close(); return false; }
+  if (!stream) {
+    Serial.println("[LLM] http.getStreamPtr returned null");
+    http.end(); tts.close(); return false;
+  }
   const uint32_t started = millis();
   uint32_t lastBytes = started;
   bool ok = true;
   uint8_t bytes[512];
   while (active(turn) && ok && !context.done && millis() - started < 45000 && millis() - lastBytes < 15000) {
-    if (!tts.pump()) { failure = FaultReason::Tts; ok = false; break; }
+    if (!tts.pump()) {
+      Serial.println("[LLM] tts.pump failed in streamReply loop");
+      failure = FaultReason::Tts;
+      ok = false;
+      break;
+    }
     const int available = stream->available();
     if (available > 0) {
       const int count = stream->read(bytes, min(static_cast<size_t>(available), sizeof(bytes)));
-      if (count <= 0) { ok = false; break; }
+      if (count <= 0) {
+        Serial.println("[LLM] stream->read returned <= 0");
+        ok = false;
+        break;
+      }
       lastBytes = millis();
       ok = modelBody.feed(bytes, count, bodySink, &events);
+      if (!ok) {
+        Serial.printf("[LLM] modelBody.feed returned false (err=%d)\n", static_cast<int>(modelBody.error()));
+      }
     } else if (!stream->connected() || modelBody.done()) {
       ok = modelBody.finish() && modelEvents.finish();
+      if (!ok) Serial.printf("[LLM] modelBody/modelEvents finish failed (bodyErr=%d, sseErr=%d)\n",
+          static_cast<int>(modelBody.error()), static_cast<int>(modelEvents.error()));
       break;
     }
     if (ok && modelChunks.pendingBytes() && millis() - context.lastTextFlush >= 250) {
       ok = modelChunks.flush(textSink, &context);
+      if (!ok) Serial.println("[LLM] modelChunks.flush failed");
     }
     delay(1);
   }
   http.end();
+  if (!ok || !context.done || !answer.length()) {
+    Serial.printf("[LLM] Loop exited: active=%d ok=%d done=%d answerLen=%u\n",
+        active(turn), ok, context.done, static_cast<unsigned>(context.answer->length()));
+  }
   ok = active(turn) && ok && context.done && answer.length();
   if (ok) {
     Serial.printf("[LLM] Text complete %lu ms after endpoint.\n",
         static_cast<unsigned long>(millis() - utteranceEndedAt.load()));
     failure = FaultReason::Tts;
     ok = modelChunks.finish(textSink, &context) && tts.finishText() && tts.drain();
+    if (!ok) Serial.println("[LLM] TTS finishText or drain failed");
   }
   tts.close();
   return ok;
@@ -794,7 +941,8 @@ void loop() {
   const uint32_t started = millis();
   bool completed = false;
   FaultReason failure = FaultReason::Asr;
-  String transcript = recognize(turn);
+  bool asrSuccess = false;
+  String transcript = recognize(turn, asrSuccess);
   String reply;
   if (transcript.length() && active(turn)) {
     Serial.printf("[USER] %s\n", transcript.c_str());
@@ -803,11 +951,15 @@ void loop() {
     if (completed && active(turn)) {
       Serial.printf("[BOT] %s\n", reply.c_str());
     }
+  } else if (asrSuccess && active(turn)) {
+    Serial.println("[ASR] No speech recognized in utterance; continuing session.");
+    completed = true;
   }
   cloud.close();
   if (generation.load() == turn && sessionEnabled.load()) {
-    if (completed) rememberReply(transcript, reply);
-    else {
+    if (completed) {
+      if (transcript.length()) rememberReply(transcript, reply);
+    } else {
       faultReason.store(failure);
       audioFault.store(turn);  // Capture stops the session and updates the TFT.
       Serial.println("[ERROR] Voice request failed; tap to start again.");

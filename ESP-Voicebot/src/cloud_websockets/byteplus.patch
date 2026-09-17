@@ -1,0 +1,77 @@
+--- a/WebSockets.h
++++ b/WebSockets.h
+@@ -25,6 +25,10 @@
+ #ifndef WEBSOCKETS_H_
+ #define WEBSOCKETS_H_
+ 
++#ifndef NODEBUG_WEBSOCKETS
++#define NODEBUG_WEBSOCKETS
++#endif
++
+ #ifdef STM32_DEVICE
+ #include <application.h>
+ #define bit(b) (1UL << (b))    // Taken directly from Arduino.h
+@@ -63,7 +67,7 @@
+ 
+ #if defined(ESP8266) || defined(ESP32)
+ 
+-#define WEBSOCKETS_MAX_DATA_SIZE (15 * 1024)
++#define WEBSOCKETS_MAX_DATA_SIZE (64 * 1024)
+ #define WEBSOCKETS_USE_BIG_MEM
+ #define GET_FREE_HEAP ESP.getFreeHeap()
+ // moves all Header strings to Flash (~300 Byte)
+@@ -122,7 +126,7 @@
+ #endif
+ 
+ #ifndef WEBSOCKETS_TCP_TIMEOUT
+-#define WEBSOCKETS_TCP_TIMEOUT (5000)
++#define WEBSOCKETS_TCP_TIMEOUT (15000)
+ #endif
+ 
+ #define NETWORK_ESP8266_ASYNC (0)
+--- a/WebSockets.cpp
++++ b/WebSockets.cpp
+@@ -239,12 +239,14 @@
+ 
+ #ifdef WEBSOCKETS_USE_BIG_MEM
+     // only for ESP since AVR has less HEAP
+-    // try to send data in one TCP package (only if some free Heap is there)
+-    if(!headerToPayload && ((length > 0) && (length < 1400)) && (GET_FREE_HEAP > 6000)) {
++    // Copy outgoing client payloads so every frame can use an unpredictable mask.
++    if(client->cIsClient && !headerToPayload) {
+         DEBUG_WEBSOCKETS("[WS][%d][sendFrame] pack to one TCP package...\n", client->num);
++        if(length > WEBSOCKETS_MAX_DATA_SIZE) return false;
+         uint8_t * dataPtr = (uint8_t *)malloc(length + WEBSOCKETS_MAX_HEADER_SIZE);
++        if(!dataPtr) return false;
+         if(dataPtr) {
+-            memcpy((dataPtr + WEBSOCKETS_MAX_HEADER_SIZE), payload, length);
++            if(length) memcpy((dataPtr + WEBSOCKETS_MAX_HEADER_SIZE), payload, length);
+             headerToPayload = true;
+             useInternBuffer = true;
+             payloadPtr      = dataPtr;
+@@ -263,9 +265,7 @@
+     if(client->cIsClient && useInternBuffer) {
+         // if we use a Intern Buffer we can modify the data
+         // by this fact its possible the do the masking
+-        for(uint8_t x = 0; x < sizeof(maskKey); x++) {
+-            maskKey[x] = random(0xFF);
+-        }
++        esp_fill_random(maskKey, sizeof(maskKey));
+     }
+ 
+     createHeader(headerPtr, opcode, length, client->cIsClient, maskKey, fin);
+--- a/WebSocketsClient.cpp
++++ b/WebSocketsClient.cpp
+@@ -260,6 +260,12 @@
+                 _client.tcp = NULL;
+             }
+             _client.ssl = new WEBSOCKETS_NETWORK_SSL_CLASS();
++#if defined(ESP32)
++            if(_client.ssl) {
++                _client.ssl->setHandshakeTimeout(15000);
++                _client.ssl->setTimeout(15000);
++            }
++#endif
+             _client.tcp = _client.ssl;
+             if(_CA_cert) {
+                 DEBUG_WEBSOCKETS("[WS-Client] setting CA certificate\n");

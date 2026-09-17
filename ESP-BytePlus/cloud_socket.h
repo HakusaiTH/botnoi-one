@@ -42,27 +42,35 @@ class CloudSocket : private WebSocketsClient {
       error_ = "insufficient memory for cloud headers";
       return false;
     }
+    Serial.printf("[CloudSocket] Connecting to %s:443 (free DRAM: %u bytes)\n",
+        host, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
     beginSslWithCA(host, 443, path, ca, "");
     setExtraHeaders(normalizedHeaders.c_str());
     setReconnectInterval(0);
     const uint32_t start = millis();
+    uint32_t lastPrint = start;
     while (!open_ && !error_ && millis() - start < CONNECT_TIMEOUT_MS) {
-      // The vendored client also bounds TCP reads to 3 s and TLS to 8 s.
-      // Trim a pending HTTP header read to the remaining connection budget.
       if (_client.tcp) {
         const uint32_t remaining = CONNECT_TIMEOUT_MS - (millis() - start);
-        _client.tcp->setTimeout(remaining < 3000 ? remaining : 3000);
+        _client.tcp->setTimeout(remaining < 15000 ? remaining : 15000);
       }
       WebSocketsClient::loop();
-      if (!open_) delay(1);
+      if (!open_) {
+        delay(1);
+        if (millis() - lastPrint >= 1000) {
+          Serial.printf("[CloudSocket] Handshake in progress... elapsed=%lu ms\n", millis() - start);
+          lastPrint = millis();
+        }
+      }
     }
+    Serial.printf("[CloudSocket] Connect finished: open=%d, elapsed=%lu ms, error=%s\n",
+        open_, millis() - start, error_ ? error_ : "none");
     if (!open_) {
       if (!error_) error_ = "cloud connection timed out";
       close();
       return false;
     }
-    _client.tcp->setTimeout(3000);
-    enableHeartbeat(20000, 5000, 2);
+    _client.tcp->setTimeout(15000);
     return true;
   }
 

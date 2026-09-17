@@ -1,0 +1,7 @@
+# Local configuration containing credentials
+config.local.h
+
+# Build output directories
+.vscode/
+build/
+.pio/

@@ -25,7 +25,7 @@
  
  #ifndef WEBSOCKETS_TCP_TIMEOUT
 -#define WEBSOCKETS_TCP_TIMEOUT (5000)
-+#define WEBSOCKETS_TCP_TIMEOUT (3000)
++#define WEBSOCKETS_TCP_TIMEOUT (15000)
  #endif
  
  #define NETWORK_ESP8266_ASYNC (0)
@@ -68,8 +68,8 @@
              _client.ssl = new WEBSOCKETS_NETWORK_SSL_CLASS();
 +#if defined(ESP32)
 +            if(_client.ssl) {
-+                _client.ssl->setHandshakeTimeout(8);
-+                _client.ssl->setTimeout(WEBSOCKETS_TCP_TIMEOUT);
++                _client.ssl->setHandshakeTimeout(15000);
++                _client.ssl->setTimeout(15000);
 +            }
 +#endif
              _client.tcp = _client.ssl;

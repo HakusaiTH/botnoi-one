@@ -159,6 +159,9 @@ void WebSocketsClient::beginSSL(const char * host, uint16_t port, const char * u
     _client.isSSL = true;
     _fingerprint  = fingerprint;
     _CA_cert      = NULL;
+#if defined(ESP32)
+    _CA_bundle    = NULL;
+#endif
 }
 
 #if defined(SSL_BARESSL)
@@ -262,8 +265,8 @@ void WebSocketsClient::loop(void) {
             _client.ssl = new WEBSOCKETS_NETWORK_SSL_CLASS();
 #if defined(ESP32)
             if(_client.ssl) {
-                _client.ssl->setHandshakeTimeout(8);
-                _client.ssl->setTimeout(WEBSOCKETS_TCP_TIMEOUT);
+                _client.ssl->setHandshakeTimeout(15000);
+                _client.ssl->setTimeout(15000);
             }
 #endif
             _client.tcp = _client.ssl;
@@ -635,11 +638,6 @@ bool WebSocketsClient::clientIsConnected(WSclient_t * client) {
             // do cleanup
             clientDisconnect(client, "Connection lost");
         }
-    }
-
-    if(client->tcp) {
-        // do cleanup
-        clientDisconnect(client, "TCP connection cleanup");
     }
 
     return false;
