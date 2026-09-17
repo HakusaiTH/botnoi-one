@@ -41,12 +41,15 @@ class ReplyGate {
   uint32_t lastActivity_ = 0;
 };
 
-// A one-slot FreeRTOS queue is used as a latest-frame mailbox. The capture task
-// can xQueueOverwrite it atomically while loop() is busy in TLS, so recovery
-// never starts by transmitting the beginning of an old backlog.
-constexpr size_t kMicrophoneQueueFrames = 1;
+// A 32ms DSP frame can complete two 20ms network packets at once. Four fixed
+// slots preserve that burst while loop() services TLS. A full queue evicts its
+// oldest packet, and the consumer still enforces the independent age cap.
+constexpr size_t kMicrophoneQueueFrames = 4;
 constexpr uint32_t kMicrophoneFrameMs = 20;
-constexpr uint32_t kMicrophoneMaxAgeMs = 2 * kMicrophoneFrameMs;
+// A packet's timestamp is its last captured sample, before 32ms AEC batching
+// and processing. 40ms rejects healthy packets when DSP takes 10ms; 60ms leaves
+// processing/pacing room while still preventing stale congestion playback.
+constexpr uint32_t kMicrophoneMaxAgeMs = 3 * kMicrophoneFrameMs;
 
 // Schedule from the start of each successful write. TLS time is therefore not
 // added to every 20 ms packet interval. A write that takes longer than its PCM
@@ -70,16 +73,18 @@ class MicrophonePacer {
   uint32_t next_ = 0;
 };
 
-// xQueueOverwrite is valid only for a one-slot queue and is atomic against the
-// loop task's xQueueReceive. The callback returns the real mailbox result.
-template <typename Overwrite>
-bool overwriteMicrophone(const AudioFrame& frame, Overwrite overwrite) {
+// There is one producer. If a concurrent consumer already made room after the
+// first failed send, dropping may return false; the one retry is still valid.
+template <typename Send, typename DropOldest>
+bool enqueueRecentMicrophone(const AudioFrame& frame, Send send, DropOldest dropOldest) {
   if (!frame.length || frame.length > kFrameBytes || (frame.length & 1)) return false;
-  return overwrite(frame);
+  if (send(frame)) return true;
+  dropOldest();
+  return send(frame);
 }
 
 // Drop stale PCM after a transport pause even when capture has stopped and the
-// latest-frame replacement policy is no longer advancing the mailbox.
+// recent-frame replacement policy is no longer advancing the queue.
 inline bool microphoneFrameExpired(uint32_t now, uint32_t capturedAt,
                                    uint32_t maxAgeMs = kMicrophoneMaxAgeMs) {
   return static_cast<uint32_t>(now - capturedAt) >= maxAgeMs;

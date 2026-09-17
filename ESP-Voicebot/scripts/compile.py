@@ -66,6 +66,8 @@ def main():
     parser.add_argument("--config-file", type=Path, default=os.environ.get("ARDUINO_CONFIG_FILE"))
     parser.add_argument("--install-deps", action="store_true", help="Download pinned official core and ArduinoJson into the selected toolchain")
     parser.add_argument("--target", choices=["all", *TARGETS], default="all")
+    parser.add_argument("--aec", choices=["default", "on", "off"], default="default",
+                        help="Use firmware default, or explicitly compile AEC on/off (dummy credentials remain enforced)")
     parser.add_argument("--build-root", type=Path, help="Artifact and default isolated toolchain directory")
     parser.add_argument("--sketch", type=Path, default=Path(__file__).resolve().parents[1], help="Sketch source directory (for baseline comparisons)")
     args = parser.parse_args()
@@ -117,7 +119,7 @@ def main():
     stage_sketch(sketch, staged)
     summary = {
         "arduino_cli": cli_version, "esp32_core": CORE_VERSION, "arduinojson": JSON_VERSION,
-        "credentials": "dummy", "targets": {},
+        "credentials": "dummy", "aec": args.aec, "targets": {},
         "staged_source_sha256": {
             str(path.relative_to(staged)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(staged.rglob("*")) if path.is_file()
@@ -128,7 +130,11 @@ def main():
         print(f"\nBuilding {name}: {fqbn}", flush=True)
         log_path = artifact / f"{name}.log"
         compile_command = command + ["compile", "--fqbn", fqbn, "--warnings", "all",
-                                     "--build-path", str(artifact / name), str(staged)]
+                                     "--build-path", str(artifact / name)]
+        if args.aec != "default":
+            compile_command += ["--build-property", "compiler.cpp.extra_flags=-DVOICEBOT_AEC_ENABLED=" +
+                                ("1" if args.aec == "on" else "0")]
+        compile_command += [str(staged)]
         with log_path.open("w") as log:
             process = subprocess.Popen(compile_command, env=environment, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True)

@@ -18,12 +18,13 @@ def main():
     flags = ['-std=c++11', '-Wall', '-Wextra', '-Werror', '-g',
              '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     with tempfile.TemporaryDirectory(prefix='esp-voicebot-tests-') as tmp:
-        for name in ('test_audio_pipeline', 'test_microphone_flow', 'test_playback_flow', 'test_session_flow', 'test_websocket_stream', 'test_websocket_writable'):
+        for name in ('test_audio_pipeline', 'test_capture_pipeline', 'test_duplex_timeline', 'test_microphone_flow', 'test_playback_flow', 'test_session_flow', 'test_speaker_packetizer', 'test_websocket_stream', 'test_websocket_writable'):
             binary = Path(tmp) / name
             subprocess.run([compiler, *flags, str(sketch / 'tests' / (name + '.cpp')), '-o', str(binary)], check=True)
             subprocess.run([str(binary)], check=True)
         subprocess.run(['bash', str(sketch / 'tests/client/run.sh')], check=True,
                        env=dict(os.environ, ARDUINOJSON_DIR=str(args.arduinojson.resolve())))
+        subprocess.run(['bash', str(sketch / 'tests/aec_wrapper/run.sh')], check=True)
     print('All host suites passed. Hardware I2S/Wi-Fi/TLS runtime still requires a board.')
 
 

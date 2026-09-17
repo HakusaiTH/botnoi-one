@@ -13,11 +13,7 @@ class FixedQueue {
  public:
   size_t spaces() const { return frames_.size() - count_; }
   size_t size() const { return count_; }
-  bool overwrite(const AudioFrame& frame) {
-    if (count_) {
-      frames_[head_] = frame;
-      return true;
-    }
+  bool send(const AudioFrame& frame) {
     if (!spaces()) return false;
     frames_[(head_ + count_) % frames_.size()] = frame;
     ++count_;
@@ -31,7 +27,10 @@ class FixedQueue {
     return true;
   }
   bool enqueue(const AudioFrame& frame) {
-    return overwriteMicrophone(frame, [&](const AudioFrame& value) { return overwrite(value); });
+    return enqueueRecentMicrophone(frame, [&](const AudioFrame& value) { return send(value); }, [&]() {
+      AudioFrame discarded;
+      return receive(discarded);
+    });
   }
  private:
   std::array<AudioFrame, kMicrophoneQueueFrames> frames_{};
@@ -53,8 +52,8 @@ static void testStalledNetworkKeepsLatestAudio() {
   size_t stale = 0, captured = 0, replacements = 0, peakDepth = 0;
   std::vector<uint32_t> sentCapturedAt;
 
-  // The consumer cannot run for 800 ms. Each new capture replaces the old
-  // mailbox entry, so recovery can immediately send current rather than stale PCM.
+  // The consumer cannot run for 800ms. The fixed FIFO evicts oldest audio,
+  // then the independent age bound prevents replaying stale PCM on recovery.
   for (uint32_t now = 0; now <= 2000; ++now) {
     if (now % 20 == 0) {
       ++captured;
@@ -87,23 +86,23 @@ static void testStalledNetworkKeepsLatestAudio() {
       pacer.sent(now, frame.length);
     }
   }
-  assert(peakDepth == 1 && replacements > 0 && stale == 0);
+  assert(peakDepth == kMicrophoneQueueFrames && replacements > 0 && stale > 0);
   assert(captured == sentCapturedAt.size() + replacements + stale + queue.size());
   assert(queue.size() == 0);
   for (size_t i = 1; i < sentCapturedAt.size(); ++i) {
     assert(sentCapturedAt[i] > sentCapturedAt[i - 1]);
   }
   assert(sentCapturedAt[9] == 180);
-  // The exact recovery-time frame is already in the mailbox and goes next.
-  assert(sentCapturedAt[10] == 1000);
+  assert(sentCapturedAt[10] >= 1000 - kMicrophoneMaxAgeMs + 1);
 }
 
 static void testAtomicLatestMailboxAndInputValidation() {
   FixedQueue queue;
   for (uint32_t now = 0; now < 100; now += 20) assert(queue.enqueue(microphoneFrame(now)));
-  assert(queue.size() == 1 && queue.spaces() == 0);
+  assert(queue.size() == kMicrophoneQueueFrames && queue.spaces() == 0);
   AudioFrame frame;
-  assert(queue.receive(frame) && frame.capturedAt == 80);
+  assert(queue.receive(frame) && frame.capturedAt == 20);
+  while (queue.receive(frame)) {}
   assert(!queue.size());
 
   AudioFrame invalid = microphoneFrame(0);
@@ -116,26 +115,26 @@ static void testAtomicLatestMailboxAndInputValidation() {
 
   size_t sends = 0;
   AudioFrame valid = microphoneFrame(0);
-  assert(!overwriteMicrophone(valid,
-      [&](const AudioFrame&) { ++sends; return false; }));
-  assert(sends == 1);
+  assert(!enqueueRecentMicrophone(valid,
+      [&](const AudioFrame&) { ++sends; return false; }, []() { return false; }));
+  assert(sends == 2);
   sends = 0;
   bool sendCalled = false;
-  assert(overwriteMicrophone(valid,
-      [&](const AudioFrame&) { ++sends; sendCalled = true; return true; }));
+  assert(enqueueRecentMicrophone(valid,
+      [&](const AudioFrame&) { ++sends; sendCalled = true; return true; }, []() { assert(false); return false; }));
   assert(sends == 1);
   assert(sendCalled);  // The send callback owns the real queue result.
 }
 
 static void testAgeBoundAndRollover() {
-  assert(!microphoneFrameExpired(39, 0));
-  assert(microphoneFrameExpired(40, 0));
+  assert(!microphoneFrameExpired(59, 0));
+  assert(microphoneFrameExpired(60, 0));
   assert(!microphoneFrameExpired(249, 0, 250));
   assert(microphoneFrameExpired(250, 0, 250));
 
   const uint32_t base = UINT32_MAX - 40;
-  assert(!microphoneFrameExpired(base + 39, base));
-  assert(microphoneFrameExpired(base + 40, base));
+  assert(!microphoneFrameExpired(base + 59, base));
+  assert(microphoneFrameExpired(base + 60, base));
 
   // If capture stops during a long transport pause, age filtering still removes
   // the queued latest frame rather than transmitting old audio on recovery.
@@ -147,7 +146,7 @@ static void testAgeBoundAndRollover() {
     assert(microphoneFrameExpired(1000, frame.capturedAt));
     ++stale;
   }
-  assert(stale == 1);
+  assert(stale == kMicrophoneQueueFrames);
 }
 
 static void testReplyPauseAndAutomaticResume() {
@@ -230,5 +229,5 @@ int main() {
   testReplyPauseAndAutomaticResume();
   testPauseDuringCaptureAndStopDuringReply();
   testPacingAndRollover();
-  std::puts("Microphone flow: latest-frame mailbox, bounded age, reply pause/resume and send-start pacing passed");
+  std::puts("Microphone flow: bounded recent FIFO, age rejection, reply pause/resume and send-start pacing passed");
 }

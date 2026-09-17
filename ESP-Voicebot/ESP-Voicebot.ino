@@ -2,7 +2,6 @@
 // Only loop() owns WebSocket/TLS. Audio tasks use fixed queues.
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESP_I2S.h>
 #include <atomic>
 #include <time.h>
 #include <esp_heap_caps.h>
@@ -14,6 +13,10 @@
 #include "config.example.h"
 #include "audio_pipeline.h"
 #include "microphone_flow.h"
+#include "capture_pipeline.h"
+#include "speaker_packetizer.h"
+#include "duplex_audio.h"
+#include "echo_canceller.h"
 #include "playback_flow.h"
 #include "session_flow.h"
 #include "voicebot_client.h"
@@ -24,18 +27,17 @@
 #endif
 
 constexpr int BUTTON_SESSION = VOICEBOT_BUTTON_PIN;
-constexpr int MIC_SCK = 3, MIC_WS = 2, MIC_SD = 1;
-constexpr int SPK_BCLK = 38, SPK_LRC = 39, SPK_DIN = 40;
 constexpr int LED_PIN = 48;
-constexpr uint32_t SAMPLE_RATE = 16000;
 constexpr size_t FRAME_BYTES = voicebot_audio::kFrameBytes;
 constexpr size_t MIC_QUEUE_FRAMES = voicebot_audio::kMicrophoneQueueFrames;
 constexpr size_t SPK_PSRAM_FRAMES = 800, SPK_INTERNAL_FRAMES = 24;
-constexpr uint32_t CAPTURE_STACK_BYTES = 4096, PLAYBACK_STACK_BYTES = 4096;
+constexpr uint32_t CAPTURE_STACK_BYTES = 8192, PLAYBACK_STACK_BYTES = 4096;
 constexpr uint32_t INTERNAL_RESERVE = 64 * 1024, TLS_LARGEST_BLOCK = 32 * 1024;
 using voicebot_audio::AudioFrame;
 
-I2SClass microphone, speaker;
+voicebot_audio::DuplexAudio duplexAudio;
+voicebot_audio::EchoCanceller echoCanceller;
+voicebot_audio::CapturePipeline capturePipeline;
 QueueHandle_t micQueue = nullptr, spkQueue = nullptr;
 StaticQueue_t micQueueState, spkQueueState;
 uint8_t *micStorage = nullptr, *spkStorage = nullptr;
@@ -44,8 +46,9 @@ std::atomic<bool> sessionActive{false};
 std::atomic<bool> micSuppressed{false};
 std::atomic<uint32_t> micFullDrops{0};
 std::atomic<uint32_t> recordingEpoch{0};
+std::atomic<uint32_t> recordingStartedAt{0};
 std::atomic<uint32_t> sessionEpoch{1}, playbackGeneration{1};
-std::atomic<uint32_t> pendingSpeakerFrames{0}, playbackStartedGeneration{0};
+std::atomic<uint32_t> pendingSpeakerFrames{0}, playbackPartialSamples{0};
 std::atomic<uint32_t> playbackDrainedAt{0};
 std::atomic<bool> playbackDrainedValid{false};
 std::atomic<uint32_t> audioFault{0};
@@ -58,6 +61,8 @@ voicebot_audio::PlaybackFlow playbackFlow;
 voicebot_session::SessionIntent sessionIntent;
 voicebot_session::ReconnectBackoff reconnectBackoff;
 bool ready = false, micPauseAnnounced = false;
+bool aecActive = false, fullDuplex = false;  // Fixed before audio tasks start.
+std::atomic<uint32_t> captureDiscontinuities{0};
 uint32_t connectionIntent = 0;
 uint32_t micExpiredDrops = 0, micPausedDrops = 0, maxSocketMs = 0, maxMicSendMs = 0;
 
@@ -75,14 +80,20 @@ QueueHandle_t makeAudioQueue(size_t count, uint32_t caps, StaticQueue_t* state, 
 
 void reportMemory() {
   const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
-  Serial.printf("[RAM] internal free=%u min=%u largest=%u; PSRAM free=%u; speaker queued=%u\n",
+  Serial.printf("[RAM] internal free=%u min=%u largest=%u; PSRAM free=%u; speaker queued=%u staged/DMA=%u\n",
       unsigned(heap_caps_get_free_size(caps)), unsigned(heap_caps_get_minimum_free_size(caps)),
       unsigned(heap_caps_get_largest_free_block(caps)),
-      unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)), unsigned(pendingSpeakerFrames.load()));
+      unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)), unsigned(pendingSpeakerFrames.load()), unsigned(duplexAudio.pendingBlocks()));
   Serial.printf("[FLOW] mic queued=%u replaced/expired=%u/%u paused=%s; max socket=%ums send=%ums\n",
       unsigned(micQueue ? uxQueueMessagesWaiting(micQueue) : 0), unsigned(micFullDrops.load()),
       unsigned(micExpiredDrops), micSuppressed.load() ? "yes" : "no",
       unsigned(maxSocketMs), unsigned(maxMicSendMs));
+  const auto diagnostic = duplexAudio.diagnostics();
+  const auto aec = echoCanceller.stats();
+  Serial.printf("[AEC] active=%s frames=%u max process=%uus; resync=%u RX/ref drops=%u/%u alignment=%u DMA gaps=%u\n",
+      aecActive ? "yes" : "no", unsigned(aec.processedFrames), unsigned(aec.maxProcessMicros),
+      unsigned(captureDiscontinuities.load()), unsigned(diagnostic.rxOverflows), unsigned(diagnostic.referenceOverflows),
+      unsigned(diagnostic.alignmentDrops), unsigned(diagnostic.dmaDiscontinuities));
   if (captureHandle && playbackHandle) {
     Serial.printf("[STACK] minimum unused bytes: capture=%u playback=%u loop=%u\n",
         unsigned(uxTaskGetStackHighWaterMark(captureHandle)),
@@ -98,6 +109,7 @@ void invalidatePlayback() {
     next = previous + 1;
     if (!next) next = 1;  // Zero means no I2S samples have started.
   } while (!playbackGeneration.compare_exchange_weak(previous, next));
+  duplexAudio.invalidate(next);
 }
 
 void releaseSpeakerFrame() {
@@ -133,30 +145,22 @@ void resetSession() {
   playbackFlow.reset();
   if (micQueue) xQueueReset(micQueue);
   clearPlayback();
-  playbackStartedGeneration.store(0);
+  duplexAudio.clearPlaybackProgress();
   playbackDrainedValid.store(false);
 }
 
 void captureTask(void*) {
   int stable = digitalRead(BUTTON_SESSION), previous = stable;
-  uint32_t changed = millis(), epoch = sessionEpoch.load();
+  uint32_t changed = millis(), lastCapture = changed;
   bool pressedToStart = !sessionIntent.requested();
-  int32_t raw[FRAME_BYTES / 2];
-  AudioFrame frame{};
+  voicebot_audio::AlignedAudioBlock block{};
   for (;;) {
     const uint32_t readEpoch = sessionEpoch.load();
-    const bool recordThisRead = recordingEpoch.load() == readEpoch && sessionActive.load() && !micSuppressed.load();
-    size_t received = 0;
-    const esp_err_t status = i2s_channel_read(microphone.rxChan(), raw, sizeof(raw), &received, 30);
+    const bool received = duplexAudio.receive(block, 20);
     const uint32_t now = millis();
-    if (epoch != sessionEpoch.load()) {
-      epoch = sessionEpoch.load();
-    }
     const int reading = digitalRead(BUTTON_SESSION);
     if (reading != previous) {
       changed = now;
-      // Snapshot the intended action on the physical edge. A transport failure
-      // during the debounce window must not reinterpret Hang up as Start.
       if (reading == LOW) pressedToStart = !sessionIntent.requested();
     }
     previous = reading;
@@ -165,8 +169,6 @@ void captureTask(void*) {
       if (stable == LOW) {
         sessionIntent.publish(pressedToStart);
         if (!pressedToStart) {
-          // Stop capture and invalidate queued playback even while loop() is
-          // inside TLS. loop() owns queue cleanup and the close handshake.
           recordingEpoch.store(0);
           micSuppressed.store(true);
           invalidatePlayback();
@@ -174,65 +176,110 @@ void captureTask(void*) {
         }
       }
     }
-    // Keep the hangup control responsive even if microphone I2S is failing.
-    if (status != ESP_OK && status != ESP_ERR_TIMEOUT) {
-      reportAudioFault(2);
-      recordingEpoch.store(0);
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
+    if (!received) {
+      if (now - lastCapture >= 500 || duplexAudio.invalidDmaEvents()) reportAudioFault(2);
+      continue;  // Keep the physical Stop button usable after a hardware error.
     }
-    if (recordThisRead && sessionActive.load() && !micSuppressed.load() && readEpoch == epoch && received) {
-      const size_t samples = received / sizeof(int32_t);
-      frame.generation = epoch;
-      frame.capturedAt = now;
-      frame.length = samples * sizeof(int16_t);
-      for (size_t i = 0; i < samples; ++i) {
-        const int16_t sample = static_cast<int16_t>(raw[i] >> 16);
-        frame.pcm[2 * i] = static_cast<uint8_t>(sample);
-        frame.pcm[2 * i + 1] = static_cast<uint8_t>(static_cast<uint16_t>(sample) >> 8);
-      }
-      const bool replaced = uxQueueSpacesAvailable(micQueue) == 0;
-      if (frame.length && !voicebot_audio::overwriteMicrophone(frame,
-          [](const AudioFrame& packet) { return xQueueOverwrite(micQueue, &packet) == pdPASS; })) {
-        reportAudioFault(5);
-      } else if (replaced) micFullDrops.fetch_add(1);
-    }
+    lastCapture = now;
+    if (block.discontinuity) captureDiscontinuities.fetch_add(1);
+    const uint32_t epoch = sessionEpoch.load();
+    const bool upload = readEpoch == epoch && recordingEpoch.load() == epoch &&
+        sessionActive.load() && !micSuppressed.load() &&
+        static_cast<int32_t>(block.capturedAtMillis - 10 - recordingStartedAt.load()) >= 0;
+    const bool ok = capturePipeline.push(block.mic, block.reference, voicebot_audio::kDuplexSamples,
+        block.capturedAtMillis, epoch, upload, block.discontinuity,
+        [](const int16_t* mic, const int16_t* reference, int16_t* output, size_t samples) {
+          if (aecActive) return echoCanceller.process(mic, reference, output, samples);
+          memcpy(output, mic, samples * sizeof(int16_t));
+          return true;
+        },
+        [](const AudioFrame& frame) {
+          // DSP continues through every sample. Only network packets are
+          // evicted under TLS congestion; the acoustic reference never skips.
+          if (!sessionActive.load() || recordingEpoch.load() != frame.generation || micSuppressed.load()) return true;
+          return voicebot_audio::enqueueRecentMicrophone(frame,
+              [](const AudioFrame& value) { return xQueueSend(micQueue, &value, 0) == pdTRUE; },
+              []() {
+                AudioFrame discarded;
+                const bool dropped = xQueueReceive(micQueue, &discarded, 0) == pdTRUE;
+                if (dropped) micFullDrops.fetch_add(1);
+                return dropped;
+              });
+        });
+    if (!ok) reportAudioFault(7);
     vTaskDelay(1);
   }
 }
 
 void playbackTask(void*) {
   AudioFrame frame{};
-  int16_t stereo[FRAME_BYTES];
+  voicebot_audio::SpeakerPacketizer packetizer(70);
+  bool haveFrame = false;
+  size_t offset = 0;
+  uint32_t lastInput = millis(), lastProgress = lastInput;
   for (;;) {
-    if (xQueueReceive(spkQueue, &frame, pdMS_TO_TICKS(20)) != pdTRUE) continue;
-    if (frame.generation == playbackGeneration.load()) {
-      for (size_t i = 0; i < frame.length / 2; ++i) {
-        const int16_t sample = static_cast<int16_t>(frame.pcm[2 * i] | (uint16_t(frame.pcm[2 * i + 1]) << 8));
-        stereo[2 * i] = stereo[2 * i + 1] = static_cast<int16_t>(int32_t(sample) * 70 / 100);
-      }
-      size_t offset = 0;
-      const size_t length = frame.length * 2;
-      uint32_t lastProgress = millis();
-      while (offset < length && frame.generation == playbackGeneration.load()) {
-        size_t written = 0;
-        const esp_err_t status = i2s_channel_write(speaker.txChan(),
-            reinterpret_cast<uint8_t*>(stereo) + offset, length - offset, &written, 20);
-        offset += written;
-        if (written) {
-          // Announce playback only after I2S accepted real samples, not when a
-          // frame was merely removed from the software queue.
-          playbackStartedGeneration.store(frame.generation);
-          lastProgress = millis();
-        }
-        if ((status != ESP_OK && status != ESP_ERR_TIMEOUT) || millis() - lastProgress > 200) {
-          reportAudioFault(3);
-          break;
-        }
-        if (!written) vTaskDelay(1);
-      }
+    const uint32_t generation = playbackGeneration.load();
+    if (packetizer.size() && packetizer.generation() != generation) {
+      packetizer.reset();
+      playbackDrainedAt.store(millis());
+      playbackDrainedValid.store(true);
+      playbackPartialSamples.store(0);
     }
-    releaseSpeakerFrame();
+    // A new-current frame may already be held while only the old partial is
+    // stale. Retire each ownership independently so Stop/Start cannot lose it.
+    if (haveFrame && frame.generation != generation) { releaseSpeakerFrame(); haveFrame = false; }
+    // A delayed player can wake with contiguous PCM already in the queue.
+    // Consume that before treating elapsed wall time as an end-of-burst gap.
+    bool partialIdle = packetizer.size() && !packetizer.full() && !haveFrame && millis() - lastInput >= 20;
+    if (partialIdle && xQueueReceive(spkQueue, &frame, 0) == pdTRUE) {
+      haveFrame = true;
+      offset = 0;
+      partialIdle = false;
+      if (frame.generation != playbackGeneration.load()) { releaseSpeakerFrame(); haveFrame = false; continue; }
+    }
+    // Pack across arbitrary WebSocket boundaries. Only a final partial block
+    // with an empty source queue and 20ms input idle is padded by the adapter.
+    if (packetizer.full() || partialIdle) {
+      if (duplexAudio.submit(packetizer.data(), packetizer.size(), packetizer.generation())) {
+        // Driver accounting is visible before removing our buffered samples.
+        packetizer.reset();
+        playbackPartialSamples.store(0);
+        lastProgress = millis();
+      } else {
+        if (millis() - lastProgress > 200 && packetizer.generation() == playbackGeneration.load()) reportAudioFault(3);
+        vTaskDelay(1);
+      }
+      continue;
+    }
+    if (!haveFrame) {
+      const TickType_t wait = packetizer.size() ? pdMS_TO_TICKS(1) : pdMS_TO_TICKS(20);
+      if (xQueueReceive(spkQueue, &frame, wait) != pdTRUE) { lastProgress = millis(); continue; }
+      haveFrame = true;
+      offset = 0;
+      if (frame.generation != playbackGeneration.load()) { releaseSpeakerFrame(); haveFrame = false; continue; }
+    }
+    // Stop can happen between the loop-top check and dequeue. Revalidate both
+    // objects before append; a cancelled partial is not a pipeline failure.
+    const uint32_t currentGeneration = playbackGeneration.load();
+    if (packetizer.size() && packetizer.generation() != currentGeneration) {
+      packetizer.reset();
+      playbackDrainedAt.store(millis());
+      playbackDrainedValid.store(true);
+      playbackPartialSamples.store(0);
+    }
+    if (frame.generation != currentGeneration) { releaseSpeakerFrame(); haveFrame = false; continue; }
+    const size_t copied = packetizer.append(frame, offset);
+    if (!copied) {
+      if (frame.generation == playbackGeneration.load()) reportAudioFault(4);
+      releaseSpeakerFrame();
+      haveFrame = false;
+      continue;
+    }
+    offset += copied;
+    lastInput = millis();
+    // Publish the partial block before releasing the source queue frame.
+    playbackPartialSamples.store(packetizer.size());
+    if (offset == frame.length / 2) { releaseSpeakerFrame(); haveFrame = false; }
   }
 }
 
@@ -240,8 +287,8 @@ void releaseAudio() {
   // Only used before ready=true; loop() cannot touch partial initialization.
   if (captureHandle) { vTaskDelete(captureHandle); captureHandle = nullptr; }
   if (playbackHandle) { vTaskDelete(playbackHandle); playbackHandle = nullptr; }
-  microphone.end();
-  speaker.end();
+  duplexAudio.end();
+  echoCanceller.end();
   if (micQueue) { vQueueDelete(micQueue); micQueue = nullptr; }
   if (spkQueue) { vQueueDelete(spkQueue); spkQueue = nullptr; }
   heap_caps_free(micStorage); micStorage = nullptr;
@@ -263,7 +310,6 @@ void setup() {
       psramRequested ? "yes" : "no", esp_psram_is_initialized() ? "yes" : "no",
       unsigned(ESP.getPsramSize()), unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
       unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
-  Serial.printf("[MIC] %s\n", VOICEBOT_FULL_DUPLEX ? "Full duplex enabled." : "Echo muted with silence during bot replies; listening resumes automatically.");
   Serial.println("[SESSION] Tap once to start a hands-free call; tap again to hang up.");
   pinMode(BUTTON_SESSION, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
@@ -283,11 +329,22 @@ void setup() {
   Serial.printf("[RAM] mic=%u bytes; speaker=%u bytes (%s). No full TTS allocation.\n",
       unsigned(MIC_QUEUE_FRAMES * sizeof(AudioFrame)), unsigned(speakerFrames * sizeof(AudioFrame)),
       speakerFrames == SPK_PSRAM_FRAMES ? "PSRAM" : "small internal buffer");
-  microphone.setPins(MIC_SCK, MIC_WS, -1, MIC_SD);
-  speaker.setPins(SPK_BCLK, SPK_LRC, SPK_DIN, -1);
-  if (!microphone.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT) ||
-      !speaker.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
-    Serial.println("[ERROR] I2S initialization failed; network disabled.");
+  // Native AEC allocates once before Wi-Fi or any competing audio tasks. The
+  // library requires PSRAM internally even if its public caps say otherwise.
+  if (VOICEBOT_AEC_ENABLED) {
+    aecActive = echoCanceller.begin() == voicebot_audio::EchoCancellerStatus::Ready;
+    const auto aec = echoCanceller.stats();
+    Serial.printf("[AEC] %s; allocated internal=%u PSRAM=%u bytes.\n", echoCanceller.statusMessage(),
+        unsigned(aec.internalBytesUsed), unsigned(aec.psramBytesUsed));
+    if (!aecActive) Serial.println("[AEC] Half-duplex fallback: voice barge-in unavailable. Check PSRAM/OPI selection and memory diagnostics.");
+  }
+  fullDuplex = aecActive || (!VOICEBOT_AEC_ENABLED && VOICEBOT_FULL_DUPLEX);
+  Serial.println(aecActive ? "[MIC] Echo-cancelled full duplex: keep speaking to interrupt the bot."
+                          : (fullDuplex ? "[MIC] Raw full duplex explicitly enabled; external echo control required."
+                                        : "[MIC] Half duplex: silence during bot replies, then listening resumes."));
+  if (!capturePipeline.configure(aecActive ? echoCanceller.frameSamples() : voicebot_audio::kDuplexSamples, aecActive) ||
+      !duplexAudio.begin()) {
+    Serial.println("[ERROR] Duplex I2S initialization failed; network disabled.");
     releaseAudio();
     return;
   }
@@ -315,7 +372,7 @@ void setup() {
     }
     playbackDrainedValid.store(false);
     replyGate.onAudio(now);
-    if (!VOICEBOT_FULL_DUPLEX) micSuppressed.store(true);
+    if (!fullDuplex) micSuppressed.store(true);
     const bool ok = ttsAssembler.append(pcm, length, generation, [](const AudioFrame& frame) {
       pendingSpeakerFrames.fetch_add(1);
       if (xQueueSend(spkQueue, &frame, 0) == pdTRUE) return true;
@@ -345,6 +402,7 @@ void setup() {
     resetSession();
     sessionActive.store(true);
     reconnectBackoff.opened(millis());
+    recordingStartedAt.store(millis());
     recordingEpoch.store(sessionEpoch.load());
     digitalWrite(LED_PIN, HIGH);
     Serial.println("[SESSION] Ready; microphone streams continuously until hangup.");
@@ -382,9 +440,10 @@ void abortConnection(const char* reason, bool retryable) {
 
 void serviceMicrophone() {
   if (!sessionActive.load() || !sessionIntent.current(connectionIntent) || !voicebot.isOpened()) return;
-  const bool pause = !VOICEBOT_FULL_DUPLEX &&
+  const bool pause = !fullDuplex &&
       (playbackFlow.micPaused() ||
-       replyGate.paused(millis(), voicebot.isReceivingAudio(), pendingSpeakerFrames.load() != 0));
+       replyGate.paused(millis(), voicebot.isReceivingAudio(),
+           pendingSpeakerFrames.load() != 0 || playbackPartialSamples.load() != 0 || duplexAudio.pendingBlocks() != 0));
   micSuppressed.store(pause);
   if (pause != micPauseAnnounced) {
     micPauseAnnounced = pause;
@@ -401,8 +460,8 @@ void serviceMicrophone() {
       if (frame.generation == sessionEpoch.load() && frame.length) ++micPausedDrops;
     }
   }
-  // A congested socket is not a session error. Capture atomically overwrites
-  // this one-slot mailbox, so the next send is always the latest PCM frame.
+  // A congested socket is not a session error. The fixed recent-audio queue
+  // absorbs DSP packet bursts and evicts old PCM; the age check bounds latency.
   const uint32_t now = millis();
   if (!micPacer.due(now) || !voicebot.canSendNow()) return;
   if (pause) {
@@ -448,7 +507,7 @@ void loop() {
   }
   const uint32_t fault = audioFault.exchange(0);
   if (fault) {
-    Serial.printf("[AUDIO] fault=%u (2=mic I2S, 3=speaker I2S, 4=TTS queue, 5=mic mailbox).\n",
+    Serial.printf("[AUDIO] fault=%u (2=duplex I2S, 3=speaker staging, 4=TTS queue, 7=AEC/capture pipeline).\n",
                   unsigned(fault));
     abortConnection("Audio pipeline stopped", false);
   }
@@ -505,10 +564,18 @@ void loop() {
         using voicebot_audio::PlaybackAction;
         // Read pending first: pending==0 acquires the worker's prior drain
         // telemetry. Function argument evaluation order alone cannot do this.
-        const uint32_t pending = pendingSpeakerFrames.load();
-        const bool drainedValid = playbackDrainedValid.load();
-        const uint32_t drainedAt = playbackDrainedAt.load();
-        const uint32_t startedGeneration = playbackStartedGeneration.load();
+        const uint32_t softwarePending = pendingSpeakerFrames.load();
+        const uint32_t partialPending = playbackPartialSamples.load() ? 1 : 0;
+        const uint32_t pending = softwarePending + partialPending + duplexAudio.pendingBlocks();
+        const bool softwareDrainedValid = playbackDrainedValid.load();
+        const bool dmaDrainedValid = duplexAudio.drainedValid();
+        const bool drainedValid = softwareDrainedValid || dmaDrainedValid;
+        const uint32_t softwareDrainedAt = playbackDrainedAt.load();
+        const uint32_t dmaDrainedAt = duplexAudio.drainedAt();
+        const uint32_t drainedAt = !softwareDrainedValid ? dmaDrainedAt :
+            (!dmaDrainedValid ? softwareDrainedAt :
+             (static_cast<int32_t>(dmaDrainedAt - softwareDrainedAt) > 0 ? dmaDrainedAt : softwareDrainedAt));
+        const uint32_t startedGeneration = duplexAudio.startedGeneration();
         const bool wasActive = playbackFlow.micPaused();
         // Take now after the worker timestamps, including at tick rollover.
         const PlaybackAction action = playbackFlow.nextAction(millis(),
@@ -522,7 +589,7 @@ void loop() {
         }
         if (wasActive && !playbackFlow.micPaused()) {
           ttsAssembler.reset();  // Never carry a dangling byte into a new burst.
-          playbackStartedGeneration.store(0);
+          duplexAudio.clearPlaybackProgress();
           playbackDrainedValid.store(false);
           replyGate.reset();
         }
