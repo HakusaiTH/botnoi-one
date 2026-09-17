@@ -21,7 +21,7 @@
 เมื่อ Client ส่งคำขอ Upgrade HTTP/1.1 เป็น WebSocket:
 
 ```http
-GET /v1/preview_call?api_key=ak_xVKcjMpcwS2-F4U_n3KbEps1gMWR_WOC&agent_id=agt_75d51d8b540d HTTP/1.1
+GET /v1/preview_call?api_key=YOUR_BOTNOI_API_KEY&agent_id=YOUR_BOTNOI_AGENT_ID HTTP/1.1
 Host: voicebot-stg.botnoigroup.com
 Upgrade: websocket
 Connection: Upgrade
@@ -184,13 +184,16 @@ Server ส่งข้อความทักทายอัตโนมัต�
 
 ---
 
-## 6. ข้อกำหนดสำคัญสำหรับการเขียนเฟิร์มแวร์ ESP32-S3
+## 6. Current firmware guidance (2026-09-17)
 
-1. **ขนาดบัฟเฟอร์ WebSocket (`WEBSOCKETS_MAX_DATA_SIZE`)**:
-   - ต้องขยายจาก 64 KB เป็น **256 KB** ใน `WebSockets.h` เนื่องจากก้อนข้อมูลเสียงพากย์จาก Botnoi มีขนาดใหญ่ถึง 64,000+ Bytes
-2. **การจัดสรร RAM (`MALLOC_CAP_SPIRAM`)**:
-   - การสร้างบัฟเฟอร์ขนาดใหญ่ 64KB+ ใน `WebSockets.cpp` ต้องใช้ **PSRAM (8 MB)** ผ่านคำสั่ง `heap_caps_malloc` เพื่อป้องกัน Internal DRAM หมด
-3. **การเชื่อมต่อ SSL กับ Cloudflare**:
-   - ต้องใช้ `beginSSL(host, port, url, NULL)` เพื่อเปิดใช้ `setInsecure()` ป้องกันปัญหาสายหลุดจาก Root CA Mismatch เมื่อ Cloudflare เปลี่ยนสลับใบรับรอง
-4. **การบริหารจัดการ Queue เสียงลำโพง (`spkQueue`)**:
-   - ต้องใช้ขนาดบัฟเฟอร์ 200 เฟรม (เก็บเสียงได้ 4 วินาที) และใช้การดันข้อมูลเข้า Queue แบบ Non-blocking (`0` tick wait) เพื่อไม่ให้กระทบ WebSocket Socket Read Loop
+The wire examples above describe the historical inspection. The old advice to
+allocate complete 256 KiB messages, fall back to internal malloc, disable TLS
+verification, or ignore speaker queue overflow has been superseded.
+
+The current firmware streams binary PCM in fixed 640-byte chunks, applies TCP
+backpressure when its bounded queue is full, and validates the server using the
+real GTS Root R4 certificate. It handles text/binary fragmentation separately,
+uses one task for all socket operations, and sends ordered, paced trailing
+silence. See [README.md](README.md) for current setup, RAM budgets and validation
+limits. The 437,912-byte greeting documented here is also a host PCM regression
+fixture size; that host test does not establish on-device audio success.

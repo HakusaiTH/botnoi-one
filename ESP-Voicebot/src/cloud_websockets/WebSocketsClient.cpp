@@ -24,6 +24,7 @@
 
 #include "WebSockets.h"
 #include "WebSocketsClient.h"
+#include <strings.h>
 
 WebSocketsClient::WebSocketsClient() {
     _cbEvent             = NULL;
@@ -33,6 +34,10 @@ WebSocketsClient::WebSocketsClient() {
     _reconnectInterval   = 500;
     _port                = 0;
     _host                = "";
+#if defined(HAS_SSL) && defined(SSL_AXTLS)
+    _client_cert = NULL;
+    _client_key = NULL;
+#endif
 }
 
 WebSocketsClient::~WebSocketsClient() {
@@ -43,6 +48,11 @@ WebSocketsClient::~WebSocketsClient() {
  * calles to init the Websockets server
  */
 void WebSocketsClient::begin(const char * host, uint16_t port, const char * url, const char * protocol) {
+    if(_client.tcp) clientDisconnect(&_client, "Restarting connection");
+    _client.rx.reset();
+    _client.rxBackpressured = false;
+    _client.httpLine = "";
+    _client.httpHeaderBytes = 0;
     _host = host;
     _port = port;
 #if defined(HAS_SSL)
@@ -263,11 +273,14 @@ void WebSocketsClient::loop(void) {
                 _client.tcp = NULL;
             }
             _client.ssl = new WEBSOCKETS_NETWORK_SSL_CLASS();
-#if defined(ESP32)
-            if(_client.ssl) {
-                _client.ssl->setHandshakeTimeout(15000);
-                _client.ssl->setTimeout(15000);
+            if(!_client.ssl) {
+                _lastConnectionFail = millis();
+                return;
             }
+#if defined(ESP32)
+            // ESP32 handshake timeout uses SECONDS; stream timeout uses ms.
+            _client.ssl->setHandshakeTimeout(8);
+            _client.ssl->setTimeout(WEBSOCKETS_TCP_TIMEOUT);
 #endif
             _client.tcp = _client.ssl;
             if(_CA_cert) {
@@ -351,8 +364,13 @@ void WebSocketsClient::loop(void) {
         handleClientData();
         WEBSOCKETS_YIELD();
         if(_client.status == WSC_CONNECTED) {
-            handleHBPing();
-            handleHBTimeout(&_client);
+            if(_client.rxBackpressured) {
+                // A pong may be queued behind the audio we intentionally paused.
+                _client.lastPing = millis();
+            } else {
+                handleHBPing();
+                handleHBTimeout(&_client);
+            }
         }
     }
 }
@@ -565,10 +583,7 @@ void WebSocketsClient::clientDisconnect(WSclient_t * client, const char * reason
 
 #ifdef HAS_SSL
     if(client->isSSL && client->ssl) {
-        if(client->ssl->connected()) {
-            client->ssl->flush();
-            client->ssl->stop();
-        }
+        client->ssl->stop();
         event = true;
         delete client->ssl;
         client->ssl = NULL;
@@ -577,12 +592,7 @@ void WebSocketsClient::clientDisconnect(WSclient_t * client, const char * reason
 #endif
 
     if(client->tcp) {
-        if(client->tcp->connected()) {
-#if (WEBSOCKETS_NETWORK_TYPE != NETWORK_ESP8266_ASYNC)
-            client->tcp->flush();
-#endif
-            client->tcp->stop();
-        }
+        client->tcp->stop();
         event = true;
 #if (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP8266_ASYNC)
         client->status = WSC_NOT_CONNECTED;
@@ -603,6 +613,10 @@ void WebSocketsClient::clientDisconnect(WSclient_t * client, const char * reason
     client->cIsUpgrade   = false;
     client->cIsWebsocket = false;
     client->cSessionId   = "";
+    client->rx.reset();
+    client->rxBackpressured = false;
+    client->httpLine = "";
+    client->httpHeaderBytes = 0;
 
     client->status      = WSC_NOT_CONNECTED;
     _lastConnectionFail = millis();
@@ -627,7 +641,9 @@ bool WebSocketsClient::clientIsConnected(WSclient_t * client) {
         return false;
     }
 
-    if(client->tcp->connected()) {
+    // Drain already received bytes before EOF cleanup, including a final
+    // continuation delivered together with the peer's TCP FIN.
+    if(client->tcp->available() > 0 || client->tcp->connected()) {
         if(client->status != WSC_NOT_CONNECTED) {
             return true;
         }
@@ -647,32 +663,37 @@ bool WebSocketsClient::clientIsConnected(WSclient_t * client) {
  * Handel incomming data from Client
  */
 void WebSocketsClient::handleClientData(void) {
-    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && _lastHeaderSent + WEBSOCKETS_TCP_TIMEOUT < millis()) {
+    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && uint32_t(millis() - _lastHeaderSent) > WEBSOCKETS_TCP_TIMEOUT) {
         DEBUG_WEBSOCKETS("[WS-Client][handleClientData] header response timeout.. disconnecting!\n");
         clientDisconnect(&_client, "Header response timeout");
         WEBSOCKETS_YIELD();
         return;
     }
 
-    int len = _client.tcp->available();
-    if(len > 0) {
-        switch(_client.status) {
-            case WSC_HEADER: {
-                String headerLine = _client.tcp->readStringUntil('\n');
-                handleHeader(&_client, &headerLine);
-            } break;
-            case WSC_BODY: {
-                char buf[256] = { 0 };
-                _client.tcp->readBytes(&buf[0], std::min((size_t)len, sizeof(buf)));
-                String bodyLine = buf;
-                handleHeader(&_client, &bodyLine);
-            } break;
-            case WSC_CONNECTED:
-                WebSockets::handleWebsocket(&_client);
+    if(_client.status == WSC_CONNECTED) {
+        // Also service the inactivity timer when no bytes are available.
+        WebSockets::handleWebsocket(&_client);
+    } else if(_client.status == WSC_HEADER || _client.status == WSC_BODY) {
+        // Incremental, capped HTTP headers avoid readStringUntil's allocation
+        // growth and blocking wait if a server sends an incomplete line.
+        size_t budget = WebSocketsStream::kChunkSize;
+        while(budget-- && _client.tcp && _client.tcp->available() > 0) {
+            const int ch = _client.tcp->read();
+            if(ch < 0) break;
+            if(++_client.httpHeaderBytes > 8192 || _client.httpLine.length() >= 1024) {
+                clientDisconnect(&_client, "HTTP response headers too large");
+                return;
+            }
+            if(ch == '\n') {
+                String line = _client.httpLine;
+                _client.httpLine = "";
+                handleHeader(&_client, &line);
                 break;
-            default:
-                WebSockets::clientDisconnect(&_client, 1002);
-                break;
+            }
+            if(!_client.httpLine.concat(static_cast<char>(ch))) {
+                clientDisconnect(&_client, "HTTP response allocation failed");
+                return;
+            }
         }
     }
     WEBSOCKETS_YIELD();
@@ -689,10 +710,13 @@ void WebSocketsClient::sendHeader(WSclient_t * client) {
     DEBUG_WEBSOCKETS("[WS-Client][sendHeader] sending header...\n");
 
     uint8_t randomKey[16] = { 0 };
-
+#if defined(ESP32)
+    esp_fill_random(randomKey, sizeof(randomKey));
+#else
     for(uint8_t i = 0; i < sizeof(randomKey); i++) {
         randomKey[i] = random(0xFF);
     }
+#endif
 
     client->cKey = base64_encode(&randomKey[0], 16);
 
@@ -746,7 +770,14 @@ void WebSocketsClient::sendHeader(WSclient_t * client) {
         handshake += client->extraHeaders + NEW_LINE;
     }
 
-    handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
+    bool hasUserAgent = false;
+    const char * extraLine = client->extraHeaders.c_str();
+    while(extraLine && *extraLine) {
+        if(strncasecmp(extraLine, "User-Agent:", 11) == 0) { hasUserAgent = true; break; }
+        extraLine = strchr(extraLine, '\n');
+        if(extraLine) ++extraLine;
+    }
+    if(!hasUserAgent) handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
 
     if(client->base64Authorization.length() > 0) {
         handshake += WEBSOCKETS_STRING("Authorization: Basic ");
@@ -761,7 +792,10 @@ void WebSocketsClient::sendHeader(WSclient_t * client) {
     handshake += NEW_LINE;
 
     DEBUG_WEBSOCKETS("[WS-Client][sendHeader] handshake %s", (uint8_t *)handshake.c_str());
-    write(client, (uint8_t *)handshake.c_str(), handshake.length());
+    if(write(client, (uint8_t *)handshake.c_str(), handshake.length()) != handshake.length()) {
+        clientDisconnect(client, "HTTP handshake write failed");
+        return;
+    }
 
 #if (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP8266_ASYNC)
     client->tcp->readStringUntil('\n', &(client->cHttpLine), std::bind(&WebSocketsClient::handleHeader, this, client, &(client->cHttpLine)));
@@ -991,6 +1025,7 @@ void WebSocketsClient::connectedCb() {
 
 void WebSocketsClient::connectFailedCb() {
     DEBUG_WEBSOCKETS("[WS-Client] connection to %s:%u Failed\n", _host.c_str(), _port);
+    clientDisconnect(&_client, "Connection failed");
 }
 
 #if (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP8266_ASYNC)

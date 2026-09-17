@@ -11,11 +11,11 @@
 
 // Botnoi Voicebot API Credentials
 #ifndef BOTNOI_API_KEY
-#define BOTNOI_API_KEY "ak_xVKcjMpcwS2-F4U_n3KbEps1gMWR_WOC"
+#define BOTNOI_API_KEY "YOUR_BOTNOI_API_KEY"
 #endif
 
 #ifndef BOTNOI_AGENT_ID
-#define BOTNOI_AGENT_ID "agt_75d51d8b540d"
+#define BOTNOI_AGENT_ID "YOUR_BOTNOI_AGENT_ID"
 #endif
 
 #ifndef BOTNOI_WS_HOST
@@ -28,4 +28,10 @@
 
 #ifndef BOTNOI_WS_PORT
 #define BOTNOI_WS_PORT 443
+#endif
+
+// GPIO46 preserves the existing wiring. It is an ESP32-S3 boot strapping pin;
+// see README before adding an external pull resistor. GPIO4 is an alternative.
+#ifndef VOICEBOT_BUTTON_PIN
+#define VOICEBOT_BUTTON_PIN 46
 #endif

@@ -87,6 +87,11 @@ class WebSocketsClient : protected WebSockets {
 
     void onEvent(WebSocketClientEvent cbEvent);
 
+    // Callbacks are synchronous on the task that calls loop(). Binary events
+    // contain <=640 bytes; fragmented text is assembled with an 8192-byte cap.
+    void setBinaryReceiveCapacity(std::function<size_t()> cb) { _binaryCapacity = cb; }
+    bool isReceivingBinary() const { return _client.rx.isReceivingBinary(); }
+
     bool sendTXT(uint8_t * payload, size_t length = 0, bool headerToPayload = false);
     bool sendTXT(const uint8_t * payload, size_t length = 0);
     bool sendTXT(char * payload, size_t length = 0, bool headerToPayload = false);
@@ -153,6 +158,8 @@ class WebSocketsClient : protected WebSockets {
     WSclient_t _client;
 
     WebSocketClientEvent _cbEvent;
+    std::function<size_t()> _binaryCapacity;
+    size_t binaryReceiveCapacity() override { return _binaryCapacity ? _binaryCapacity() : SIZE_MAX; }
 
     unsigned long _lastConnectionFail;
     unsigned long _reconnectInterval;

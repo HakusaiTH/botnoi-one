@@ -45,6 +45,7 @@
 #endif
 
 #include "WebSocketsVersion.h"
+#include "WebSocketsStream.h"
 
 #ifndef NODEBUG_WEBSOCKETS
 #ifdef DEBUG_ESP_PORT
@@ -67,7 +68,7 @@
 
 #if defined(ESP8266) || defined(ESP32)
 
-#define WEBSOCKETS_MAX_DATA_SIZE (256 * 1024)
+#define WEBSOCKETS_MAX_DATA_SIZE WebSocketsStream::kBinaryMessageLimit
 #define WEBSOCKETS_USE_BIG_MEM
 #define GET_FREE_HEAP ESP.getFreeHeap()
 // moves all Header strings to Flash (~300 Byte)
@@ -126,7 +127,7 @@
 #endif
 
 #ifndef WEBSOCKETS_TCP_TIMEOUT
-#define WEBSOCKETS_TCP_TIMEOUT (15000)
+#define WEBSOCKETS_TCP_TIMEOUT (3000)
 #endif
 
 #define NETWORK_ESP8266_ASYNC (0)
@@ -398,9 +399,10 @@ typedef struct {
     String cExtensions;       ///< client Sec-WebSocket-Extensions
     uint16_t cVersion = 0;    ///< client Sec-WebSocket-Version
 
-    uint8_t cWsRXsize = 0;                            ///< State of the RX
-    uint8_t cWsHeader[WEBSOCKETS_MAX_HEADER_SIZE];    ///< RX WS Message buffer
-    WSMessageHeader_t cWsHeaderDecode;
+    WebSocketsStream rx;
+    bool rxBackpressured = false;
+    String httpLine;
+    size_t httpHeaderBytes = 0;
 
     String base64Authorization;    ///< Base64 encoded Auth request
     String plainAuthorization;     ///< Base64 encoded Auth request
@@ -425,35 +427,24 @@ typedef struct {
 
 class WebSockets {
   protected:
-#ifdef __AVR__
-    typedef void (*WSreadWaitCb)(WSclient_t * client, bool ok);
-#else
-    typedef std::function<void(WSclient_t * client, bool ok)> WSreadWaitCb;
-#endif
-
     virtual void clientDisconnect(WSclient_t * client)  = 0;
     virtual bool clientIsConnected(WSclient_t * client) = 0;
 
     void clientDisconnect(WSclient_t * client, uint16_t code, char * reason = NULL, size_t reasonLen = 0);
 
     virtual void messageReceived(WSclient_t * client, WSopcode_t opcode, uint8_t * payload, size_t length, bool fin) = 0;
+    virtual size_t binaryReceiveCapacity() { return SIZE_MAX; }
 
     uint8_t createHeader(uint8_t * buf, WSopcode_t opcode, size_t length, bool mask, uint8_t maskKey[4], bool fin);
-    bool sendFrameHeader(WSclient_t * client, WSopcode_t opcode, size_t length = 0, bool fin = true);
     bool sendFrame(WSclient_t * client, WSopcode_t opcode, uint8_t * payload = NULL, size_t length = 0, bool fin = true, bool headerToPayload = false);
 
     void headerDone(WSclient_t * client);
 
     void handleWebsocket(WSclient_t * client);
 
-    bool handleWebsocketWaitFor(WSclient_t * client, size_t size);
-    void handleWebsocketCb(WSclient_t * client);
-    void handleWebsocketPayloadCb(WSclient_t * client, bool ok, uint8_t * payload);
-
     String acceptKey(String & clientKey);
     String base64_encode(uint8_t * data, size_t length);
 
-    bool readCb(WSclient_t * client, uint8_t * out, size_t n, WSreadWaitCb cb);
     virtual size_t write(WSclient_t * client, uint8_t * out, size_t n);
     size_t write(WSclient_t * client, const char * out);
 

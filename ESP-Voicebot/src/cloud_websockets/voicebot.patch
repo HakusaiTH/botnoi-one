@@ -1,0 +1,898 @@
+--- a/WebSockets.cpp
++++ b/WebSockets.cpp
+@@ -98 +98 @@
+-    } else if(length < 0xFFFF) {
++    } else if(length <= 0xFFFF) {
+@@ -127 +127 @@
+-    } else if(length < 0xFFFF) {
++    } else if(length <= 0xFFFF) {
+@@ -167,21 +166,0 @@
+-}
+-
+-/**
+- *
+- * @param client WSclient_t *   ptr to the client struct
+- * @param opcode WSopcode_t
+- * @param length size_t         length of the payload
+- * @param fin bool              can be used to send data in more then one frame (set fin on the last frame)
+- * @return true if ok
+- */
+-bool WebSockets::sendFrameHeader(WSclient_t * client, WSopcode_t opcode, size_t length, bool fin) {
+-    uint8_t maskKey[4]                         = { 0x00, 0x00, 0x00, 0x00 };
+-    uint8_t buffer[WEBSOCKETS_MAX_HEADER_SIZE] = { 0 };
+-
+-    uint8_t headerSize = createHeader(&buffer[0], opcode, length, client->cIsClient, maskKey, fin);
+-
+-    if(write(client, &buffer[0], headerSize) != headerSize) {
+-        return false;
+-    }
+-
+-    return true;
+@@ -201,35 +180,8 @@
+-    if(client->tcp && !client->tcp->connected()) {
+-        DEBUG_WEBSOCKETS("[WS][%d][sendFrame] not Connected!?\n", client->num);
+-        return false;
+-    }
+-
+-    if(client->status != WSC_CONNECTED) {
+-        DEBUG_WEBSOCKETS("[WS][%d][sendFrame] not in WSC_CONNECTED state!?\n", client->num);
+-        return false;
+-    }
+-
+-    DEBUG_WEBSOCKETS("[WS][%d][sendFrame] ------- send message frame -------\n", client->num);
+-    DEBUG_WEBSOCKETS("[WS][%d][sendFrame] fin: %u opCode: %u mask: %u length: %u headerToPayload: %u\n", client->num, fin, opcode, client->cIsClient, length, headerToPayload);
+-
+-    if(opcode == WSop_text) {
+-        DEBUG_WEBSOCKETS("[WS][%d][sendFrame] text: %s\n", client->num, (payload + (headerToPayload ? 14 : 0)));
+-    }
+-
+-    uint8_t maskKey[4]                         = { 0x00, 0x00, 0x00, 0x00 };
+-    uint8_t buffer[WEBSOCKETS_MAX_HEADER_SIZE] = { 0 };
+-
+-    uint8_t headerSize;
+-    uint8_t * headerPtr;
+-    uint8_t * payloadPtr = payload;
+-    bool useInternBuffer = false;
+-    bool ret             = true;
+-
+-    // calculate header Size
+-    if(length < 126) {
+-        headerSize = 2;
+-    } else if(length < 0xFFFF) {
+-        headerSize = 4;
+-    } else {
+-        headerSize = 10;
+-    }
+-
++    if(!client->tcp || !client->tcp->connected() || client->status != WSC_CONNECTED ||
++       (!payload && length) || length > WEBSOCKETS_MAX_DATA_SIZE) return false;
++    if((opcode & 0x08) && (!fin || length > 125)) return false;
++
++    // One bounded scratch buffer handles masking without modifying the source.
++    // The common 640-byte microphone packet and header share one TLS write.
++    uint8_t buffer[WebSocketsStream::kChunkSize + WEBSOCKETS_MAX_HEADER_SIZE];
++    uint8_t maskKey[4] = { 0 };
+@@ -237,84 +189,25 @@
+-        headerSize += 4;
+-    }
+-
+-#ifdef WEBSOCKETS_USE_BIG_MEM
+-    // only for ESP since AVR has less HEAP
+-    // try to send data in one TCP package (only if some free Heap is there)
+-    if(!headerToPayload && ((length > 0) && (length < 1400)) && (GET_FREE_HEAP > 6000)) {
+-        DEBUG_WEBSOCKETS("[WS][%d][sendFrame] pack to one TCP package...\n", client->num);
+-        uint8_t * dataPtr = (uint8_t *)malloc(length + WEBSOCKETS_MAX_HEADER_SIZE);
+-        if(dataPtr) {
+-            memcpy((dataPtr + WEBSOCKETS_MAX_HEADER_SIZE), payload, length);
+-            headerToPayload = true;
+-            useInternBuffer = true;
+-            payloadPtr      = dataPtr;
+-        }
+-    }
+-#endif
+-
+-    // set Header Pointer
+-    if(headerToPayload) {
+-        // calculate offset in payload
+-        headerPtr = (payloadPtr + (WEBSOCKETS_MAX_HEADER_SIZE - headerSize));
+-    } else {
+-        headerPtr = &buffer[0];
+-    }
+-
+-    if(client->cIsClient && useInternBuffer) {
+-        // if we use a Intern Buffer we can modify the data
+-        // by this fact its possible the do the masking
+-        for(uint8_t x = 0; x < sizeof(maskKey); x++) {
+-            maskKey[x] = random(0xFF);
+-        }
+-    }
+-
+-    createHeader(headerPtr, opcode, length, client->cIsClient, maskKey, fin);
+-
+-    if(client->cIsClient && useInternBuffer) {
+-        uint8_t * dataMaskPtr;
+-
+-        if(headerToPayload) {
+-            dataMaskPtr = (payloadPtr + WEBSOCKETS_MAX_HEADER_SIZE);
+-        } else {
+-            dataMaskPtr = payloadPtr;
+-        }
+-
+-        for(size_t x = 0; x < length; x++) {
+-            dataMaskPtr[x] = (dataMaskPtr[x] ^ maskKey[x % 4]);
+-        }
+-    }
+-
+-#ifndef NODEBUG_WEBSOCKETS
+-    unsigned long start = micros();
+-#endif
+-
+-    if(headerToPayload) {
+-        // header has be added to payload
+-        // payload is forced to reserved 14 Byte but we may not need all based on the length and mask settings
+-        // offset in payload is calculatetd 14 - headerSize
+-        if(write(client, &payloadPtr[(WEBSOCKETS_MAX_HEADER_SIZE - headerSize)], (length + headerSize)) != (length + headerSize)) {
+-            ret = false;
+-        }
+-    } else {
+-        // send header
+-        if(write(client, &buffer[0], headerSize) != headerSize) {
+-            ret = false;
+-        }
+-
+-        if(payloadPtr && length > 0) {
+-            // send payload
+-            if(write(client, &payloadPtr[0], length) != length) {
+-                ret = false;
+-            }
+-        }
+-    }
+-
+-    DEBUG_WEBSOCKETS("[WS][%d][sendFrame] sending Frame Done (%luus).\n", client->num, (micros() - start));
+-
+-#ifdef WEBSOCKETS_USE_BIG_MEM
+-    if(useInternBuffer && payloadPtr) {
+-        free(payloadPtr);
+-    }
+-#endif
+-
+-    return ret;
++#if defined(ESP32)
++        esp_fill_random(maskKey, sizeof(maskKey));
++#else
++        for(size_t i = 0; i < sizeof(maskKey); ++i) maskKey[i] = random(256);
++#endif
++    }
++    const size_t headerSize = createHeader(buffer, opcode, length, client->cIsClient, maskKey, fin);
++    const uint8_t * source = payload ? payload + (headerToPayload ? WEBSOCKETS_MAX_HEADER_SIZE : 0) : nullptr;
++    size_t offset = 0;
++    size_t prefix = headerSize;
++    do {
++        const size_t count = std::min(length - offset, static_cast<size_t>(WebSocketsStream::kChunkSize));
++        for(size_t i = 0; i < count; ++i) {
++            buffer[prefix + i] = source[offset + i] ^ (client->cIsClient ? maskKey[(offset + i) % 4] : 0);
++        }
++        if(write(client, buffer, prefix + count) != prefix + count) {
++            // A partially written frame cannot be retried on this connection.
++            // Close TCP directly: sending a close frame here would corrupt it.
++            clientDisconnect(client);
++            return false;
++        }
++        offset += count;
++        prefix = 0;
++    } while(offset < length);
++    return true;
+@@ -328,13 +221,9 @@
+-    client->status    = WSC_CONNECTED;
+-    client->cWsRXsize = 0;
+-    DEBUG_WEBSOCKETS("[WS][%d][headerDone] Header Handling Done.\n", client->num);
+-#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP8266_ASYNC)
+-    client->cHttpLine = "";
+-    handleWebsocket(client);
+-#endif
+-}
+-
+-/**
+- * handle the WebSocket stream
+- * @param client WSclient_t *  ptr to the client struct
+- */
++    client->status = WSC_CONNECTED;
++    client->rx.reset();
++    client->rxBackpressured = false;
++    client->httpLine = "";
++    client->httpHeaderBytes = 0;
++}
++
++// Read only currently available bytes. Each loop consumes at most one parser
++// boundary and <=640 payload bytes, leaving microphone/button work responsive.
+@@ -342,43 +231,6 @@
+-    if(client->cWsRXsize == 0) {
+-        handleWebsocketCb(client);
+-    }
+-}
+-
+-/**
+- * wait for
+- * @param client
+- * @param size
+- */
+-bool WebSockets::handleWebsocketWaitFor(WSclient_t * client, size_t size) {
+-    if(!client->tcp || !client->tcp->connected()) {
+-        return false;
+-    }
+-
+-    if(size > WEBSOCKETS_MAX_HEADER_SIZE) {
+-        DEBUG_WEBSOCKETS("[WS][%d][handleWebsocketWaitFor] size: %d too big!\n", client->num, size);
+-        return false;
+-    }
+-
+-    if(client->cWsRXsize >= size) {
+-        return true;
+-    }
+-
+-    DEBUG_WEBSOCKETS("[WS][%d][handleWebsocketWaitFor] size: %d cWsRXsize: %d\n", client->num, size, client->cWsRXsize);
+-    readCb(client, &client->cWsHeader[client->cWsRXsize], (size - client->cWsRXsize), std::bind([](WebSockets * server, size_t size, WSclient_t * client, bool ok) {
+-        DEBUG_WEBSOCKETS("[WS][%d][handleWebsocketWaitFor][readCb] size: %d ok: %d\n", client->num, size, ok);
+-        if(ok) {
+-            client->cWsRXsize = size;
+-            server->handleWebsocketCb(client);
+-        } else {
+-            DEBUG_WEBSOCKETS("[WS][%d][readCb] failed.\n", client->num);
+-            client->cWsRXsize = 0;
+-            // timeout or error
+-            server->clientDisconnect(client, 1002);
+-        }
+-    },
+-                                                                                          this, size, std::placeholders::_1, std::placeholders::_2));
+-    return false;
+-}
+-
+-void WebSockets::handleWebsocketCb(WSclient_t * client) {
+-    if(!client->tcp || !client->tcp->connected()) {
++    if(!client->tcp) return;
++    const size_t capacity = binaryReceiveCapacity();
++    client->rxBackpressured = client->rx.isReceivingBinary() && capacity == 0;
++    const uint32_t now = millis();
++    if(client->rx.timedOut(now, client->rxBackpressured)) {
++        clientDisconnect(client, 1002);
+@@ -387,9 +239,11 @@
+-
+-    uint8_t * buffer = client->cWsHeader;
+-
+-    WSMessageHeader_t * header = &client->cWsHeaderDecode;
+-    uint8_t * payload          = NULL;
+-
+-    uint8_t headerLen = 2;
+-
+-    if(!handleWebsocketWaitFor(client, headerLen)) {
++    const size_t wanted = client->rx.nextReadSize(capacity);
++    const int available = client->tcp->available();
++    if(!wanted || available <= 0) return;
++    uint8_t chunk[WebSocketsStream::kChunkSize];
++    const size_t count = std::min(wanted, static_cast<size_t>(available));
++    const int read = client->tcp->read(chunk, count);
++    if(read <= 0) return;
++    WebSocketsStream::Event event;
++    const uint16_t error = client->rx.consume(chunk, static_cast<size_t>(read), now, event);
++    if(error) {
++        clientDisconnect(client, error);
+@@ -398,43 +252,8 @@
+-
+-    // split first 2 bytes in the data
+-    header->fin    = ((*buffer >> 7) & 0x01);
+-    header->rsv1   = ((*buffer >> 6) & 0x01);
+-    header->rsv2   = ((*buffer >> 5) & 0x01);
+-    header->rsv3   = ((*buffer >> 4) & 0x01);
+-    header->opCode = (WSopcode_t)(*buffer & 0x0F);
+-    buffer++;
+-
+-    header->mask       = ((*buffer >> 7) & 0x01);
+-    header->payloadLen = (WSopcode_t)(*buffer & 0x7F);
+-    buffer++;
+-
+-    if(header->payloadLen == 126) {
+-        headerLen += 2;
+-        if(!handleWebsocketWaitFor(client, headerLen)) {
+-            return;
+-        }
+-        header->payloadLen = buffer[0] << 8 | buffer[1];
+-        buffer += 2;
+-    } else if(header->payloadLen == 127) {
+-        headerLen += 8;
+-        // read 64bit integer as length
+-        if(!handleWebsocketWaitFor(client, headerLen)) {
+-            return;
+-        }
+-
+-        if(buffer[0] != 0 || buffer[1] != 0 || buffer[2] != 0 || buffer[3] != 0) {
+-            // really too big!
+-            header->payloadLen = 0xFFFFFFFF;
+-        } else {
+-            header->payloadLen = buffer[4] << 24 | buffer[5] << 16 | buffer[6] << 8 | buffer[7];
+-        }
+-        buffer += 8;
+-    }
+-
+-    DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] ------- read massage frame -------\n", client->num);
+-    DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] fin: %u rsv1: %u rsv2: %u rsv3 %u  opCode: %u\n", client->num, header->fin, header->rsv1, header->rsv2, header->rsv3, header->opCode);
+-    DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] mask: %u payloadLen: %u\n", client->num, header->mask, header->payloadLen);
+-
+-    if(header->payloadLen > WEBSOCKETS_MAX_DATA_SIZE) {
+-        DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] payload too big! (%u)\n", client->num, header->payloadLen);
+-        clientDisconnect(client, 1009);
++    // No parser/TCP access after user callbacks: callbacks may disconnect.
++    if(event.opcode == WSop_ping) {
++        if(!sendFrame(client, WSop_pong, event.data, event.length)) return;
++    } else if(event.opcode == WSop_pong) {
++        client->pongReceived = true;
++    } else if(event.opcode == WSop_close) {
++        sendFrame(client, WSop_close, event.data, event.length);
++        clientDisconnect(client);
+@@ -443,95 +262 @@
+-
+-    if(header->mask) {
+-        headerLen += 4;
+-        if(!handleWebsocketWaitFor(client, headerLen)) {
+-            return;
+-        }
+-        header->maskKey = buffer;
+-        buffer += 4;
+-    }
+-
+-    if(header->payloadLen > 0) {
+-        // if text data we need one more
+-        payload = (uint8_t *)malloc(header->payloadLen + 1);
+-
+-        if(!payload) {
+-            DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] to less memory to handle payload %d!\n", client->num, header->payloadLen);
+-            clientDisconnect(client, 1011);
+-            return;
+-        }
+-        readCb(client, payload, header->payloadLen, std::bind(&WebSockets::handleWebsocketPayloadCb, this, std::placeholders::_1, std::placeholders::_2, payload));
+-    } else {
+-        handleWebsocketPayloadCb(client, true, NULL);
+-    }
+-}
+-
+-void WebSockets::handleWebsocketPayloadCb(WSclient_t * client, bool ok, uint8_t * payload) {
+-    WSMessageHeader_t * header = &client->cWsHeaderDecode;
+-    if(ok) {
+-        if(header->payloadLen > 0) {
+-            payload[header->payloadLen] = 0x00;
+-
+-            if(header->mask) {
+-                // decode XOR
+-                for(size_t i = 0; i < header->payloadLen; i++) {
+-                    payload[i] = (payload[i] ^ header->maskKey[i % 4]);
+-                }
+-            }
+-        }
+-
+-        switch(header->opCode) {
+-            case WSop_text:
+-                DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] text: %s\n", client->num, payload);
+-                // fallthrough
+-            case WSop_binary:
+-            case WSop_continuation:
+-                messageReceived(client, header->opCode, payload, header->payloadLen, header->fin);
+-                break;
+-            case WSop_ping:
+-                // send pong back
+-                DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] ping received (%s)\n", client->num, payload ? (const char *)payload : "");
+-                sendFrame(client, WSop_pong, payload, header->payloadLen);
+-                messageReceived(client, header->opCode, payload, header->payloadLen, header->fin);
+-                break;
+-            case WSop_pong:
+-                DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] get pong (%s)\n", client->num, payload ? (const char *)payload : "");
+-                client->pongReceived = true;
+-                messageReceived(client, header->opCode, payload, header->payloadLen, header->fin);
+-                break;
+-            case WSop_close: {
+-#ifndef NODEBUG_WEBSOCKETS
+-                uint16_t reasonCode = 1000;
+-                if(header->payloadLen >= 2) {
+-                    reasonCode = payload[0] << 8 | payload[1];
+-                }
+-#endif
+-                DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] get ask for close. Code: %d\n", client->num, reasonCode);
+-                if(header->payloadLen > 2) {
+-                    DEBUG_WEBSOCKETS(" (%s)\n", (payload + 2));
+-                } else {
+-                    DEBUG_WEBSOCKETS("\n");
+-                }
+-                clientDisconnect(client, 1000);
+-            } break;
+-            default:
+-                DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] got unknown opcode: %d\n", client->num, header->opCode);
+-                clientDisconnect(client, 1002);
+-                break;
+-        }
+-
+-        if(payload) {
+-            free(payload);
+-        }
+-
+-        // reset input
+-        client->cWsRXsize = 0;
+-#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP8266_ASYNC)
+-        // register callback for next message
+-        handleWebsocketWaitFor(client, 2);
+-#endif
+-
+-    } else {
+-        DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] missing data!\n", client->num);
+-        free(payload);
+-        clientDisconnect(client, 1002);
+-    }
++    if(event.opcode) messageReceived(client, static_cast<WSopcode_t>(event.opcode), event.data, event.length, true);
+@@ -587,75 +311,0 @@
+-}
+-
+-/**
+- * read x byte from tcp or get timeout
+- * @param client WSclient_t *
+- * @param out  uint8_t * data buffer
+- * @param n size_t byte count
+- * @return true if ok
+- */
+-bool WebSockets::readCb(WSclient_t * client, uint8_t * out, size_t n, WSreadWaitCb cb) {
+-#if (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP8266_ASYNC)
+-    if(!client->tcp || !client->tcp->connected()) {
+-        return false;
+-    }
+-
+-    client->tcp->readBytes(out, n, std::bind([](WSclient_t * client, bool ok, WSreadWaitCb cb) {
+-        if(cb) {
+-            cb(client, ok);
+-        }
+-    },
+-                                       client, std::placeholders::_1, cb));
+-
+-#else
+-    unsigned long t = millis();
+-    ssize_t len;
+-    DEBUG_WEBSOCKETS("[readCb] n: %zu t: %lu\n", n, t);
+-    while(n > 0) {
+-        if(client->tcp == NULL) {
+-            DEBUG_WEBSOCKETS("[readCb] tcp is null!\n");
+-            if(cb) {
+-                cb(client, false);
+-            }
+-            return false;
+-        }
+-
+-        if(!client->tcp->connected()) {
+-            DEBUG_WEBSOCKETS("[readCb] not connected!\n");
+-            if(cb) {
+-                cb(client, false);
+-            }
+-            return false;
+-        }
+-
+-        if((millis() - t) > WEBSOCKETS_TCP_TIMEOUT) {
+-            DEBUG_WEBSOCKETS("[readCb] receive TIMEOUT! %lu\n", (millis() - t));
+-            if(cb) {
+-                cb(client, false);
+-            }
+-            return false;
+-        }
+-
+-        if(!client->tcp->available()) {
+-            WEBSOCKETS_YIELD_MORE();
+-            continue;
+-        }
+-
+-        len = client->tcp->read((uint8_t *)out, n);
+-        if(len > 0) {
+-            t = millis();
+-            out += len;
+-            n -= len;
+-            // DEBUG_WEBSOCKETS("Receive %d left %d!\n", len, n);
+-        } else {
+-            // DEBUG_WEBSOCKETS("Receive %d left %d!\n", len, n);
+-        }
+-        if(n > 0) {
+-            WEBSOCKETS_YIELD();
+-        }
+-    }
+-    if(cb) {
+-        cb(client, true);
+-    }
+-    WEBSOCKETS_YIELD();
+-#endif
+-    return true;
+@@ -698 +347,0 @@
+-            t = millis();
+--- a/WebSockets.h
++++ b/WebSockets.h
+@@ -27,0 +28,4 @@
++#ifndef NODEBUG_WEBSOCKETS
++#define NODEBUG_WEBSOCKETS
++#endif
++
+@@ -43,0 +48 @@
++#include "WebSocketsStream.h"
+@@ -66 +71 @@
+-#define WEBSOCKETS_MAX_DATA_SIZE (15 * 1024)
++#define WEBSOCKETS_MAX_DATA_SIZE WebSocketsStream::kBinaryMessageLimit
+@@ -125 +130 @@
+-#define WEBSOCKETS_TCP_TIMEOUT (5000)
++#define WEBSOCKETS_TCP_TIMEOUT (3000)
+@@ -397,3 +402,4 @@
+-    uint8_t cWsRXsize = 0;                            ///< State of the RX
+-    uint8_t cWsHeader[WEBSOCKETS_MAX_HEADER_SIZE];    ///< RX WS Message buffer
+-    WSMessageHeader_t cWsHeaderDecode;
++    WebSocketsStream rx;
++    bool rxBackpressured = false;
++    String httpLine;
++    size_t httpHeaderBytes = 0;
+@@ -424,6 +429,0 @@
+-#ifdef __AVR__
+-    typedef void (*WSreadWaitCb)(WSclient_t * client, bool ok);
+-#else
+-    typedef std::function<void(WSclient_t * client, bool ok)> WSreadWaitCb;
+-#endif
+-
+@@ -435,0 +436 @@
++    virtual size_t binaryReceiveCapacity() { return SIZE_MAX; }
+@@ -438 +438,0 @@
+-    bool sendFrameHeader(WSclient_t * client, WSopcode_t opcode, size_t length = 0, bool fin = true);
+@@ -444,4 +443,0 @@
+-
+-    bool handleWebsocketWaitFor(WSclient_t * client, size_t size);
+-    void handleWebsocketCb(WSclient_t * client);
+-    void handleWebsocketPayloadCb(WSclient_t * client, bool ok, uint8_t * payload);
+@@ -452 +447,0 @@
+-    bool readCb(WSclient_t * client, uint8_t * out, size_t n, WSreadWaitCb cb);
+--- a/WebSocketsClient.cpp
++++ b/WebSocketsClient.cpp
+@@ -26,0 +27 @@
++#include <strings.h>
+@@ -35,0 +37,4 @@
++#if defined(HAS_SSL) && defined(SSL_AXTLS)
++    _client_cert = NULL;
++    _client_key = NULL;
++#endif
+@@ -45,0 +51,5 @@
++    if(_client.tcp) clientDisconnect(&_client, "Restarting connection");
++    _client.rx.reset();
++    _client.rxBackpressured = false;
++    _client.httpLine = "";
++    _client.httpHeaderBytes = 0;
+@@ -161,0 +172,3 @@
++#if defined(ESP32)
++    _CA_bundle    = NULL;
++#endif
+@@ -262,0 +276,9 @@
++            if(!_client.ssl) {
++                _lastConnectionFail = millis();
++                return;
++            }
++#if defined(ESP32)
++            // ESP32 handshake timeout uses SECONDS; stream timeout uses ms.
++            _client.ssl->setHandshakeTimeout(8);
++            _client.ssl->setTimeout(WEBSOCKETS_TCP_TIMEOUT);
++#endif
+@@ -345,2 +367,7 @@
+-            handleHBPing();
+-            handleHBTimeout(&_client);
++            if(_client.rxBackpressured) {
++                // A pong may be queued behind the audio we intentionally paused.
++                _client.lastPing = millis();
++            } else {
++                handleHBPing();
++                handleHBTimeout(&_client);
++            }
+@@ -559,4 +586 @@
+-        if(client->ssl->connected()) {
+-            client->ssl->flush();
+-            client->ssl->stop();
+-        }
++        client->ssl->stop();
+@@ -571,6 +595 @@
+-        if(client->tcp->connected()) {
+-#if (WEBSOCKETS_NETWORK_TYPE != NETWORK_ESP8266_ASYNC)
+-            client->tcp->flush();
+-#endif
+-            client->tcp->stop();
+-        }
++        client->tcp->stop();
+@@ -596,0 +616,4 @@
++    client->rx.reset();
++    client->rxBackpressured = false;
++    client->httpLine = "";
++    client->httpHeaderBytes = 0;
+@@ -621 +644,3 @@
+-    if(client->tcp->connected()) {
++    // Drain already received bytes before EOF cleanup, including a final
++    // continuation delivered together with the peer's TCP FIN.
++    if(client->tcp->available() > 0 || client->tcp->connected()) {
+@@ -634,5 +658,0 @@
+-    if(client->tcp) {
+-        // do cleanup
+-        clientDisconnect(client, "TCP connection cleanup");
+-    }
+-
+@@ -646 +666 @@
+-    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && _lastHeaderSent + WEBSOCKETS_TCP_TIMEOUT < millis()) {
++    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && uint32_t(millis() - _lastHeaderSent) > WEBSOCKETS_TCP_TIMEOUT) {
+@@ -653,15 +673,18 @@
+-    int len = _client.tcp->available();
+-    if(len > 0) {
+-        switch(_client.status) {
+-            case WSC_HEADER: {
+-                String headerLine = _client.tcp->readStringUntil('\n');
+-                handleHeader(&_client, &headerLine);
+-            } break;
+-            case WSC_BODY: {
+-                char buf[256] = { 0 };
+-                _client.tcp->readBytes(&buf[0], std::min((size_t)len, sizeof(buf)));
+-                String bodyLine = buf;
+-                handleHeader(&_client, &bodyLine);
+-            } break;
+-            case WSC_CONNECTED:
+-                WebSockets::handleWebsocket(&_client);
++    if(_client.status == WSC_CONNECTED) {
++        // Also service the inactivity timer when no bytes are available.
++        WebSockets::handleWebsocket(&_client);
++    } else if(_client.status == WSC_HEADER || _client.status == WSC_BODY) {
++        // Incremental, capped HTTP headers avoid readStringUntil's allocation
++        // growth and blocking wait if a server sends an incomplete line.
++        size_t budget = WebSocketsStream::kChunkSize;
++        while(budget-- && _client.tcp && _client.tcp->available() > 0) {
++            const int ch = _client.tcp->read();
++            if(ch < 0) break;
++            if(++_client.httpHeaderBytes > 8192 || _client.httpLine.length() >= 1024) {
++                clientDisconnect(&_client, "HTTP response headers too large");
++                return;
++            }
++            if(ch == '\n') {
++                String line = _client.httpLine;
++                _client.httpLine = "";
++                handleHeader(&_client, &line);
+@@ -669,3 +692,5 @@
+-            default:
+-                WebSockets::clientDisconnect(&_client, 1002);
+-                break;
++            }
++            if(!_client.httpLine.concat(static_cast<char>(ch))) {
++                clientDisconnect(&_client, "HTTP response allocation failed");
++                return;
++            }
+@@ -688 +713,3 @@
+-
++#if defined(ESP32)
++    esp_fill_random(randomKey, sizeof(randomKey));
++#else
+@@ -691,0 +719 @@
++#endif
+@@ -745 +773,8 @@
+-    handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
++    bool hasUserAgent = false;
++    const char * extraLine = client->extraHeaders.c_str();
++    while(extraLine && *extraLine) {
++        if(strncasecmp(extraLine, "User-Agent:", 11) == 0) { hasUserAgent = true; break; }
++        extraLine = strchr(extraLine, '\n');
++        if(extraLine) ++extraLine;
++    }
++    if(!hasUserAgent) handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
+@@ -760 +795,4 @@
+-    write(client, (uint8_t *)handshake.c_str(), handshake.length());
++    if(write(client, (uint8_t *)handshake.c_str(), handshake.length()) != handshake.length()) {
++        clientDisconnect(client, "HTTP handshake write failed");
++        return;
++    }
+@@ -989,0 +1028 @@
++    clientDisconnect(&_client, "Connection failed");
+--- a/WebSocketsClient.h
++++ b/WebSocketsClient.h
+@@ -88,0 +89,5 @@
++
++    // Callbacks are synchronous on the task that calls loop(). Binary events
++    // contain <=640 bytes; fragmented text is assembled with an 8192-byte cap.
++    void setBinaryReceiveCapacity(std::function<size_t()> cb) { _binaryCapacity = cb; }
++    bool isReceivingBinary() const { return _client.rx.isReceivingBinary(); }
+@@ -155,0 +161,2 @@
++    std::function<size_t()> _binaryCapacity;
++    size_t binaryReceiveCapacity() override { return _binaryCapacity ? _binaryCapacity() : SIZE_MAX; }
+--- /dev/null
++++ b/WebSocketsStream.h
+@@ -0,0 +1,198 @@
++/* Bounded, incremental server-to-client framing for ESP-Voicebot.
++ * Part of the local LGPL-2.1 arduinoWebSockets client fork. */
++#ifndef WEBSOCKETS_STREAM_H_
++#define WEBSOCKETS_STREAM_H_
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++class WebSocketsStream {
++ public:
++    // 640 bytes = 20 ms of 16 kHz mono PCM16, matching the speaker queue slot.
++    enum : size_t { kChunkSize = 640, kTextLimit = 8192 };
++    enum : uint32_t { kBinaryMessageLimit = 16UL * 1024 * 1024, kIdleTimeoutMs = 15000 };
++
++    struct Event {
++        uint8_t opcode = 0;
++        uint8_t * data = nullptr;
++        size_t length = 0;
++    };
++
++    void reset() {
++        headerSize_ = 0;
++        headerNeeded_ = 2;
++        payload_ = false;
++        opcode_ = 0;
++        effectiveOpcode_ = 0;
++        fragmentOpcode_ = 0;
++        remaining_ = 0;
++        messageLength_ = 0;
++        textLength_ = 0;
++        controlLength_ = 0;
++        lastProgress_ = 0;
++    }
++
++    // A read must not cross the next parser boundary. In particular, ask the
++    // application for space BEFORE removing binary payload bytes from TCP/TLS.
++    size_t nextReadSize(size_t binaryCapacity) const {
++        if(!payload_) return headerNeeded_ - headerSize_;
++        size_t count = remaining_ < kChunkSize ? remaining_ : kChunkSize;
++        if(effectiveOpcode_ == 2 && binaryCapacity < count) count = binaryCapacity;
++        return count;
++    }
++
++    bool isReceivingBinary() const {
++        return fragmentOpcode_ == 2 || (payload_ && effectiveOpcode_ == 2) ||
++               (!payload_ && headerSize_ && (header_[0] & 0x0f) == 2);
++    }
++
++    bool inProgress() const { return headerSize_ || payload_ || fragmentOpcode_; }
++
++    bool timedOut(uint32_t now, bool applicationPaused) {
++        if(applicationPaused || !inProgress()) lastProgress_ = now;
++        return uint32_t(now - lastProgress_) > kIdleTimeoutMs;
++    }
++
++    // Returns a WebSocket close code on invalid/oversized input, otherwise 0.
++    // At most one event is produced. Its data is valid until the next read.
++    uint16_t consume(uint8_t * bytes, size_t length, uint32_t now, Event & event) {
++        event = Event();
++        if(!length || length > nextReadSize(SIZE_MAX)) return 1002;
++        lastProgress_ = now;
++        if(!payload_) {
++            memcpy(header_ + headerSize_, bytes, length);
++            headerSize_ += length;
++            if(headerSize_ < headerNeeded_) return 0;
++            if(headerNeeded_ == 2) {
++                const uint8_t len = header_[1] & 0x7f;
++                // This client negotiates no extensions; servers must not mask.
++                if((header_[0] & 0x70) || (header_[1] & 0x80)) return 1002;
++                headerNeeded_ = len == 126 ? 4 : (len == 127 ? 10 : 2);
++                if(headerSize_ < headerNeeded_) return 0;
++            }
++            const uint16_t error = decodeHeader();
++            if(error) return error;
++            if(!remaining_) return finish(event);
++            return 0;
++        }
++
++        if(effectiveOpcode_ == 2) {
++            event.opcode = 2;
++            event.data = bytes;
++            event.length = length;
++        } else if(effectiveOpcode_ == 1) {
++            memcpy(text_ + textLength_, bytes, length);
++            textLength_ += length;
++        } else {
++            memcpy(control_ + controlLength_, bytes, length);
++            controlLength_ += length;
++        }
++        remaining_ -= length;
++        if(!remaining_) return finish(event);
++        return 0;
++    }
++
++ private:
++    uint16_t decodeHeader() {
++        fin_ = (header_[0] & 0x80) != 0;
++        opcode_ = header_[0] & 0x0f;
++        const uint8_t shortLength = header_[1] & 0x7f;
++        uint64_t length = shortLength;
++        if(shortLength >= 126) {
++            length = 0;
++            for(size_t i = 2; i < headerNeeded_; ++i) length = (length << 8) | header_[i];
++            if((shortLength == 126 && length < 126) ||
++               (shortLength == 127 && (length < 65536 || (header_[2] & 0x80)))) return 1002;
++        }
++        if(opcode_ == 8 || opcode_ == 9 || opcode_ == 10) {
++            if(!fin_ || length > 125 || (opcode_ == 8 && length == 1)) return 1002;
++            effectiveOpcode_ = opcode_;
++            controlLength_ = 0;
++        } else if(opcode_ == 0 || opcode_ == 1 || opcode_ == 2) {
++            if(opcode_ == 0) {
++                if(!fragmentOpcode_) return 1002;
++                effectiveOpcode_ = fragmentOpcode_;
++            } else {
++                if(fragmentOpcode_) return 1002;
++                effectiveOpcode_ = opcode_;
++                textLength_ = 0;
++                messageLength_ = 0;
++                if(!fin_) fragmentOpcode_ = opcode_;
++            }
++            const uint32_t limit = effectiveOpcode_ == 1 ? static_cast<uint32_t>(kTextLimit) : static_cast<uint32_t>(kBinaryMessageLimit);
++            if(length > limit || messageLength_ > limit - length) return 1009;
++            messageLength_ += static_cast<uint32_t>(length);
++        } else {
++            return 1002;
++        }
++        remaining_ = static_cast<size_t>(length);
++        payload_ = true;
++        return 0;
++    }
++
++    static bool validUtf8(const uint8_t * text, size_t length) {
++        size_t i = 0;
++        while(i < length) {
++            const uint8_t lead = text[i++];
++            if(lead < 0x80) continue;
++            size_t rest;
++            uint32_t value;
++            uint32_t minimum;
++            if(lead >= 0xc2 && lead <= 0xdf) { rest = 1; value = lead & 0x1f; minimum = 0x80; }
++            else if(lead >= 0xe0 && lead <= 0xef) { rest = 2; value = lead & 0x0f; minimum = 0x800; }
++            else if(lead >= 0xf0 && lead <= 0xf4) { rest = 3; value = lead & 0x07; minimum = 0x10000; }
++            else return false;
++            if(rest > length - i) return false;
++            while(rest--) {
++                const uint8_t next = text[i++];
++                if((next & 0xc0) != 0x80) return false;
++                value = (value << 6) | (next & 0x3f);
++            }
++            if(value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) return false;
++        }
++        return true;
++    }
++
++    uint16_t finish(Event & event) {
++        if(effectiveOpcode_ == 1 && fin_) {
++            if(!validUtf8(text_, textLength_)) return 1007;
++            text_[textLength_] = 0;
++            event.opcode = 1;
++            event.data = text_;
++            event.length = textLength_;
++        } else if(effectiveOpcode_ >= 8) {
++            if(effectiveOpcode_ == 8 && controlLength_ >= 2) {
++                const uint16_t code = (uint16_t(control_[0]) << 8) | control_[1];
++                if(code < 1000 || code >= 5000 || code == 1004 || code == 1005 || code == 1006 || code == 1015) return 1002;
++                if(!validUtf8(control_ + 2, controlLength_ - 2)) return 1007;
++            }
++            event.opcode = effectiveOpcode_;
++            event.data = control_;
++            event.length = controlLength_;
++        }
++        if(effectiveOpcode_ <= 2 && fin_) fragmentOpcode_ = 0;
++        headerSize_ = 0;
++        headerNeeded_ = 2;
++        payload_ = false;
++        return 0;
++    }
++
++    uint8_t header_[10];
++    uint8_t text_[kTextLimit + 1];
++    uint8_t control_[125];
++    size_t headerSize_ = 0;
++    size_t headerNeeded_ = 2;
++    size_t remaining_ = 0;
++    size_t textLength_ = 0;
++    size_t controlLength_ = 0;
++    uint32_t messageLength_ = 0;
++    uint32_t lastProgress_ = 0;
++    uint8_t opcode_ = 0;
++    uint8_t effectiveOpcode_ = 0;
++    uint8_t fragmentOpcode_ = 0;
++    bool payload_ = false;
++    bool fin_ = false;
++};
++
++#endif

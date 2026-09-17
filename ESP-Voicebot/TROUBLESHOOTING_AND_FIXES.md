@@ -1,154 +1,70 @@
-# ESP-Voicebot: Deep Inspection, Technical Issues & Fixes Log
+# ESP-Voicebot troubleshooting and fixes
 
-## 1. Overview
-This document provides a comprehensive technical breakdown of all issues encountered, root-cause analyses, and implemented resolutions during the development and testing of the **Standalone ESP32-S3 Botnoi Voicebot Client (`ESP-Voicebot`)**.
+Updated 2026-09-17. This replaces the earlier implementation notes with behavior verified in the current source. The repository-root lowercase `troubleshooting_and_fixes.md` is a saved Chrome error page and was left untouched. The historical wire examples in `VOICEBOT_API_INSPECTION.md` are a protocol reference, not evidence of testing this revision on hardware.
 
-The objective of `ESP-Voicebot` is to establish a direct, real-time, bi-directional audio conversation between an ESP32-S3 hardware module (INMP441 microphone + MAX98357A I2S speaker) and the **Botnoi Voicebot API** over WebSockets TLS (`wss://voicebot-stg.botnoigroup.com:443/v1/preview_call?api_key=...&agent_id=...`) without requiring any PC host or Python intermediary bridge.
+## Issues fixed
 
----
+| Symptom / risk | Cause in the previous firmware | Current behavior |
+| --- | --- | --- |
+| RAM exhaustion on a long greeting | Full 256 KiB WebSocket allocations plus 100/200 audio queue slots, with large internal-RAM fallbacks | Binary data streams through a 640 B scratch buffer. Queues have fixed PSRAM/internal budgets. No allocation grows with audio-message length. |
+| Truncated replies | Nonblocking speaker queue sends ignored a full queue | Receive capacity is checked before reading binary PCM. A full speaker queue applies TCP backpressure. Unexpected enqueue failure aborts explicitly. |
+| TLS corruption or intermittent disconnects | Capture, playback and loop tasks accessed one socket concurrently | Only the Arduino loop task uses the socket; audio workers exchange frames and atomic state. |
+| Missing tail of fragmented audio / noise | Final continuation was omitted; text continuation could be sent to the speaker | The transport tracks message type, includes every binary continuation and reassembles bounded text separately. Split PCM samples retain one carry byte. |
+| Session stalls after finishing speech | Capture sent silence directly while microphone frames were still queued | An ordered end marker follows captured PCM; loop sends 25 silence frames at 20 ms intervals after it. No blocking 500 ms padding loop. |
+| Invalid TLS certificate | Bundled PEM was incomplete and start used insecure mode | Real GTS Root R4 from Google's official repository; verified TLS and valid NTP time required. Authentication query strings are not logged. |
+| Resource retention after lost TCP | Socket cleanup had been removed as a presumed handshake fix | Synchronous connection setup and EOF cleanup are handled separately. Reconnect clears session, recording, partial PCM and queued playback. |
+| Unsafe partial startup | Queue, I2S or task failure could still allow normal loop execution | Networking remains disabled after startup failure, and initialized audio resources are released. Task creation is checked. |
+| CPU/network starvation | Large frame reads, high-priority tasks, and blocking silence sends | Incremental receive work, bounded microphone work per loop, priority-2 audio tasks with blocking I2S/queue operations and explicit capture yield. |
+| Unused RAM/CPU work | Local VAD was calculated continuously but never controlled transmission | Unused detector instance and processing removed. The Botnoi server still provides VAD. Vendored VAD source remains available for future use. |
 
-## 2. Hardware & Architecture Specifications
+## Checks on the board
 
-- **Microcontroller**: ESP32-S3-WROOM-1 (16MB QSPI/OPI Flash, 8MB PSRAM).
-- **I2S Microphone (INMP441)**:
-  - BCLK: `GPIO 3`
-  - WS (LRCL): `GPIO 2`
-  - SD (Data Out): `GPIO 1`
-  - Configuration: `I2S_MODE_STD`, `16000Hz`, `I2S_DATA_BIT_WIDTH_32BIT` (24-bit left-aligned in 32-bit slot), `I2S_SLOT_MODE_MONO`, `I2S_STD_SLOT_LEFT`.
-- **I2S DAC / Amplifier (MAX98357A)**:
-  - BCLK: `GPIO 38`
-  - LRC (WS): `GPIO 39`
-  - DIN (Data In): `GPIO 40`
-  - Configuration: `I2S_MODE_STD`, `16000Hz`, `I2S_DATA_BIT_WIDTH_16BIT`, `I2S_SLOT_MODE_STEREO`, `I2S_STD_SLOT_BOTH`.
-- **Control & Display**:
-  - Talk Button: `GPIO 46` (Internal `INPUT_PULLUP`, toggle recording mode).
-  - Status LED: `GPIO 48` (HIGH when recording).
+1. Confirm the exact module, flash and PSRAM mode. The default pin map targets ESP32-S3 N16R8. A PSRAM-disabled build uses the small internal queue. GPIO46 is a strapping pin; check the README before changing button pull resistors.
+2. Capture boot logs at 115200 baud. Queue allocation, both I2S devices and both tasks must succeed. `[SESSION] Ready` appears only after verified TLS and the server's valid `opened` event.
+3. Play the complete long greeting, record a sentence, tap to finish, and verify the whole reply. Repeat with long replies and multiple turns. The speaker queue should drain without fault 4; recorded speech must not produce fault 1 under normal Wi-Fi conditions.
+4. Exercise barge-in and Wi-Fi loss/recovery. Previous-session audio must not play after reconnection. Once the new session is ready, recording requires another tap.
+5. Run for at least 30 minutes while recording `[RAM]` and `[STACK]` lines. Compare **internal free heap and largest block after equivalent idle states**; the historical minimum can only decrease. Repeat connects/disconnects. Do not infer runtime safety from the linker RAM percentage alone.
+6. Check stack minima remain comfortably above zero during the busiest operations. Persistent low headroom requires adjustment and retesting on that board. Investigate any panic, watchdog reset, heap error or declining idle heap before treating the firmware as hardware validated.
 
----
+## Log interpretation
 
-## 3. Issues Encountered & Applied Resolutions
+- `[NTP] Waiting ...`: NTP has not supplied a valid clock. Wi-Fi/time retries continue; the device will not skip certificate validation.
+- `[RAM] ... connection deferred`: available internal RAM or contiguous allocation is below the initial TLS guard. Review added features or board configuration; increasing PSRAM queue size will not fix internal heap fragmentation.
+- Fault **1**: microphone backlog exceeded the bounded queue. The current turn is aborted instead of corrupting speech. Check Wi-Fi/server responsiveness and blocking work added to loop.
+- Fault **2** / **3**: microphone / speaker I2S failure. Check hardware and inspect the Arduino core's I2S diagnostics.
+- Fault **4**: unexpected speaker enqueue failure despite the capacity contract. The session resets rather than continuing with missing samples.
+- `Invalid JSON ... memory limit`: malformed, overly nested or overly complex control message; wire text and its JSON arena each have an 8 KiB bound. Increase a limit only after examining the actual message and RAM budget.
+- `Unsupported session audio format`: the server did not advertise unpaused audio/L16, 16 kHz, one channel as documented. Do not play another format as PCM16.
 
-### Issue 1: System Freeze / Deadlock at `Connecting to wss://...`
-#### Symptom
-When the board booted, Wi-Fi connected, and time was synchronized via NTP, the Serial output stopped at:
-```text
-[Voicebot] Connecting to Botnoi Voicebot WebSocket...
-[Voicebot] Connecting to wss://voicebot-stg.botnoigroup.com:443/v1/preview_call?api_key=...&agent_id=...
-```
-The board froze completely and did not respond to button presses or process incoming WebSocket packets.
+## Validation scope
 
-#### Root Cause Analysis
-FreeRTOS task priority starvation. 
-`captureTask` and `playbackTask` were originally created using `xTaskCreatePinnedToCore` with **Priority 5** pinned to **Core 1**. 
-`captureTask` executed a continuous loop calling `i2s_channel_read()` with a 30ms timeout. Because it ran at Priority 5 without explicit cooperative yielding (`vTaskDelay`), it completely starved lower-priority tasks running on Core 1, including the main `loop()` (Priority 1), which handles the Arduino framework background tasks, Wi-Fi TCP/IP stack events, and SSL/TLS handshakes (`voicebot.loop()`).
+The repository includes reproducible Arduino builds for PSRAM enabled/disabled and sanitizer-backed host tests for framing, PCM, silence timing and protocol lifecycle. The current changes have not been flashed to a connected ESP32 in this session. Hardware audio quality, runtime TLS peaks, power stability and long-session behavior remain to be measured on the actual device.
 
-#### Applied Fix
-1. Changed `captureTask` and `playbackTask` creation from `xTaskCreatePinnedToCore` to standard `xTaskCreate` (unpinned), allowing the FreeRTOS scheduler to dynamically execute them across available cores.
-2. Reduced task priority from **Priority 5** to **Priority 2** (just above idle).
-3. Added an explicit `vTaskDelay(pdMS_TO_TICKS(1))` at the end of each `captureTask` iteration to guarantee CPU slot availability for background network processing.
+### Results recorded on 2026-09-17
 
----
+Toolchain: Arduino CLI 1.5.1, Espressif Arduino core 3.3.11, ArduinoJson 7.4.3.
+Board: `esp32:esp32:esp32s3`, 16 MB flash, `app3M_fat9M_16MB`, USB CDC disabled.
+Both updated builds passed with no compiler warnings and used dummy credentials.
 
-### Issue 2: Immediate Premature Disconnection (`Reason: TCP connection cleanup`)
-#### Symptom
-During connection attempts, the Serial log repeatedly outputted disconnections every 5 seconds:
-```text
-21:10:41.733 -> [Voicebot] ⚠️ WebSocket Disconnected (Reason: TCP connection cleanup)
-21:10:46.829 -> [Voicebot] ⚠️ WebSocket Disconnected (Reason: TCP connection cleanup)
-```
+| Build | Flash bytes | Static internal RAM bytes | RAM after globals |
+| --- | ---: | ---: | ---: |
+| Original, OPI PSRAM | 1,125,243 | 48,372 | 279,308 |
+| Updated, OPI PSRAM | 1,121,527 | 64,276 | 263,404 |
+| Updated, PSRAM disabled | 1,116,305 | 63,824 | 263,856 |
 
-#### Root Cause Analysis
-In `src/cloud_websockets/WebSocketsClient.cpp`, the internal method `clientIsConnected()` contained logic that prematurely invoked `clientDisconnect(client, "TCP connection cleanup")` if the TCP socket state returned unready while an asynchronous TLS handshake was still in progress. This destroyed the active socket before `WiFiClientSecure` could complete the TLS exchange with Cloudflare/Botnoi servers.
+The static RAM increase holds the fixed WebSocket text buffer and JSON arena.
+It replaces allocation spikes at runtime. Without PSRAM, audio queue storage
+falls from 192,600 to 23,328 bytes (about 88% less), and a complete WebSocket
+payload no longer needs a separate allocation. Runtime heap is additional to
+the static table; these are compiler results, not measured free heap on a board.
 
-#### Applied Fix
-Removed the aggressive `clientDisconnect(client, "TCP connection cleanup")` trigger inside `clientIsConnected()`, allowing `WiFiClientSecure` sufficient time to negotiate the SSL certificate and establish the WebSocket frame state.
+All three host suites passed with AddressSanitizer and UndefinedBehaviorSanitizer,
+including the 437,912-byte PCM fixture, larger WebSocket frames, fragmented text
+and binary messages, capacity limits, malformed messages, timer rollover and
+2,000 successive client JSON events. A live TLS 1.2 handshake also verified the
+hostname using only the bundled GTS Root R4 trust anchor; no authenticated
+voicebot session or on-device playback was exercised.
 
----
-
-### Issue 3: Uninitialized `_CA_bundle` Pointer & SSL Handshake Crash
-#### Symptom
-Intermittent ESP32 kernel panic / illegal memory access crash when initiating secure WebSockets via `beginSSL()`.
-
-#### Root Cause Analysis
-In ESP32 Arduino Core v3.x, `WebSocketsClient.cpp` maintained an internal `_CA_bundle` pointer. In certain code paths of `beginSSL()`, `_CA_bundle` was left uninitialized (garbage memory address), causing `WiFiClientSecure` to dereference invalid memory when attempting CA bundle validation.
-
-Furthermore, calling `beginSSL(host, port, url, NULL, "")` passed `NULL` as `const uint8_t*`, causing compiler permissive warnings/errors or invalid pointer conversions.
-
-#### Applied Fix
-1. Initialized `_CA_bundle = NULL;` explicitly in `WebSocketsClient::begin()` and `beginSSL()`.
-2. Created a dedicated helper in `voicebot_client.h`:
-   ```cpp
-   if (ca && strlen(ca) > 50 && strstr(ca, "-----BEGIN CERTIFICATE-----")) {
-     beginSslWithCA(host, port, urlPath.c_str(), ca, "");
-   } else {
-     beginSSL(host, port, urlPath.c_str());
-   }
-   ```
-   When no valid PEM certificate is supplied, `beginSSL()` relies on `setInsecure()` mode within `WiFiClientSecure` to cleanly establish TLS without memory faults.
-
----
-
-### Issue 4: Memory Exhaustion (SRAM) & Audio Buffer Overflow on Initial Greeting
-#### Symptom
-When connecting to Botnoi Voicebot API, the server immediately sends a session `opened` event followed by a large initial welcome greeting TTS audio payload (~64KB to 400KB of raw 16kHz PCM audio). This resulted in heap allocation failures or WebSocket buffer truncation.
-
-#### Root Cause Analysis
-1. The default `WEBSOCKETS_MAX_DATA_SIZE` in `WebSockets.h` was set to `64KB` (`64 * 1024`), causing payloads larger than 64KB to be rejected or dropped.
-2. Large dynamic payload buffers were being allocated in internal DRAM (`malloc()`), quickly exhausting the limited ~300KB internal SRAM of the ESP32-S3.
-
-#### Applied Fix
-1. Expanded `WEBSOCKETS_MAX_DATA_SIZE` in `src/cloud_websockets/WebSockets.h` to **256KB** (`256 * 1024`).
-2. Modified buffer allocations in `WebSockets.cpp` to explicitly request PSRAM (SPIRAM):
-   ```cpp
-   _payload = (uint8_t *) heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-   if (!_payload) {
-     _payload = (uint8_t *) malloc(size); // DRAM Fallback
-   }
-   ```
-3. Configured `micQueue` and `spkQueue` in `ESP-Voicebot.ino` to be allocated in PSRAM using `heap_caps_malloc(count * sizeof(AudioFrame), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`.
-
----
-
-### Issue 5: INMP441 Microphone 32-bit Sample Scaling & Audio Distortion
-#### Symptom
-Recorded user audio sent over WebSocket was unreadable or interpreted as loud static noise by Botnoi Voicebot server.
-
-#### Root Cause Analysis
-The INMP441 MEMS microphone outputs 24-bit audio samples left-aligned inside a 32-bit I2S slot (`int32_t`). Botnoi Voicebot WebSocket API expects **16kHz 16-bit Mono Signed Little-Endian PCM** binary frames. Sending raw 32-bit buffer bytes corrupted the audio waveform.
-
-#### Applied Fix
-In `ESP-Voicebot.ino` `captureTask`, converted the 32-bit raw I2S samples into 16-bit signed PCM samples with clipping protection before pushing to the WebSocket queue:
-```cpp
-const size_t samples = min(received / sizeof(int32_t), FRAME_BYTES / 2);
-for (size_t i = 0; i < samples; ++i) {
-  const int32_t sample = raw[i] >> 16;
-  pcm[i] = static_cast<int16_t>(sample > 32767 ? 32767 : (sample < -32768 ? -32768 : sample));
-}
-```
-
----
-
-### Issue 6: Botnoi Server VAD Not Triggering Upon Releasing Button
-#### Symptom
-After the user held GPIO46 button, spoke a command, and released the button, the Botnoi server remained silent and did not process the user's turn.
-
-#### Root Cause Analysis
-Botnoi Voicebot API uses server-side Voice Activity Detection (VAD). If binary PCM transmission stops abruptly when the button is released, the server's VAD buffer remains waiting for trailing silence to confirm the end of speech.
-
-#### Applied Fix
-Added `sendSilencePadding(25)` inside `VoicebotClient`. When recording toggles `OFF` (button release), the ESP32 sends 25 frames (500ms total) of zeroed PCM binary frames (`0x00`), signaling the end of speech to Botnoi's server-side VAD and instantly triggering the bot's response generation.
-
----
-
-## 4. Verification & Testing Results
-
-1. **Standalone Inspection (`scratch/deep_inspect_voicebot.py`)**:
-   - Verified Botnoi Voicebot protocol:
-     - URL: `wss://voicebot-stg.botnoigroup.com:443/v1/preview_call?api_key=...&agent_id=...`
-     - Connection message: `{"type": "opened", "session_id": "..."}`
-     - Welcome message: `{"type": "bot_turn_response", "text": "สวัสดีครับ..."}`
-     - Received ~437KB binary payload (13.68 seconds of 16kHz PCM audio).
-2. **ESP32 Firmware Compile & Execution**:
-   - Firmware compiles cleanly under Arduino IDE / ESP32 Core 3.x.
-   - Wi-Fi connection and NTP time sync execute reliably.
-   - Core tasks (`captureTask`, `playbackTask`) execute seamlessly alongside `voicebot.loop()` without starving Core 1.
+Local build logs and source-hash manifest: `build/compile-wn9z9o6v/summary.json`,
+`opi.log`, and `none.log` (ignored build artifacts). The compiled firmware source
+hashes match this revision, except for deliberately substituted test credentials.
