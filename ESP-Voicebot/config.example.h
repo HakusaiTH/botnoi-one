@@ -49,3 +49,59 @@
 #ifndef VOICEBOT_FULL_DUPLEX
 #define VOICEBOT_FULL_DUPLEX 0
 #endif
+
+// 2.8" 320x240 ILI9341 SPI panel showing the animated robot face. Set
+// VOICEBOT_DISPLAY_ENABLED 0 to build audio-only firmware. The touch
+// controller on the module is not used and needs no wiring.
+#ifndef VOICEBOT_DISPLAY_ENABLED
+#define VOICEBOT_DISPLAY_ENABLED 1
+#endif
+
+#ifndef VOICEBOT_DISPLAY_SCK_PIN
+#define VOICEBOT_DISPLAY_SCK_PIN 42
+#endif
+
+#ifndef VOICEBOT_DISPLAY_MOSI_PIN
+#define VOICEBOT_DISPLAY_MOSI_PIN 41
+#endif
+
+#ifndef VOICEBOT_DISPLAY_DC_PIN
+#define VOICEBOT_DISPLAY_DC_PIN 45
+#endif
+
+#ifndef VOICEBOT_DISPLAY_CS_PIN
+#define VOICEBOT_DISPLAY_CS_PIN 47
+#endif
+
+// Set to -1 when the panel's RESET is tied to the board's own reset line.
+#ifndef VOICEBOT_DISPLAY_RESET_PIN
+#define VOICEBOT_DISPLAY_RESET_PIN 14
+#endif
+
+// Set to -1 when LED is wired permanently on. A GPIO cannot safely source the
+// backlight current of every module; see README before driving it directly.
+#ifndef VOICEBOT_DISPLAY_BACKLIGHT_PIN
+#define VOICEBOT_DISPLAY_BACKLIGHT_PIN 21
+#endif
+
+// Rotations 1 and 3 are landscape; 3 flips a panel mounted upside down.
+#ifndef VOICEBOT_DISPLAY_ROTATION
+#define VOICEBOT_DISPLAY_ROTATION 1
+#endif
+
+// SPI3 keeps the panel off the bus the global Arduino SPI object claims.
+#ifndef VOICEBOT_DISPLAY_SPI_BUS
+#define VOICEBOT_DISPLAY_SPI_BUS HSPI
+#endif
+
+// 40 MHz is the ceiling for SPI pins routed through the GPIO matrix, which is
+// every pin above. Raising it requires the S3's dedicated IOMUX SPI pins.
+#ifndef VOICEBOT_DISPLAY_SPI_HZ
+#define VOICEBOT_DISPLAY_SPI_HZ 40000000
+#endif
+
+// Frame interval of the face task. 33ms is about 30 frames per second, which
+// is enough for the mouth to track syllables without starving the audio tasks.
+#ifndef VOICEBOT_DISPLAY_FRAME_MS
+#define VOICEBOT_DISPLAY_FRAME_MS 33
+#endif

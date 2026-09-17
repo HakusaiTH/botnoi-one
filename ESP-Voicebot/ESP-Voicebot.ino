@@ -19,6 +19,11 @@
 #include "echo_canceller.h"
 #include "playback_flow.h"
 #include "session_flow.h"
+#include "audio_envelope.h"
+#include "face_state.h"
+#if VOICEBOT_DISPLAY_ENABLED
+#include "face_display.h"
+#endif
 #include "voicebot_client.h"
 #include "tls_roots.h"
 
@@ -32,6 +37,10 @@ constexpr size_t FRAME_BYTES = voicebot_audio::kFrameBytes;
 constexpr size_t MIC_QUEUE_FRAMES = voicebot_audio::kMicrophoneQueueFrames;
 constexpr size_t SPK_PSRAM_FRAMES = 800, SPK_INTERNAL_FRAMES = 24;
 constexpr uint32_t CAPTURE_STACK_BYTES = 8192, PLAYBACK_STACK_BYTES = 4096;
+constexpr uint32_t FACE_STACK_BYTES = 4096;
+// A final transcript without reply audio looks like the bot is thinking. The
+// cap keeps a dropped or empty reply from freezing that expression.
+constexpr uint32_t FACE_THINKING_MS = 6000;
 constexpr uint32_t INTERNAL_RESERVE = 64 * 1024, TLS_LARGEST_BLOCK = 32 * 1024;
 using voicebot_audio::AudioFrame;
 
@@ -53,6 +62,20 @@ std::atomic<uint32_t> playbackDrainedAt{0};
 std::atomic<bool> playbackDrainedValid{false};
 std::atomic<uint32_t> audioFault{0};
 std::atomic<bool> audioHealthy{true};
+// Face inputs. Only loop() writes the mood; only the audio tasks write the
+// levels. The render task reads all three and touches nothing else.
+std::atomic<uint8_t> faceMood{uint8_t(voicebot_face::Mood::Boot)};
+std::atomic<uint8_t> speakerFaceLevel{0}, microphoneFaceLevel{0};
+std::atomic<uint32_t> transcriptFinalAt{0};
+std::atomic<bool> transcriptFinalPending{false};
+voicebot_face::Envelope speakerEnvelope(voicebot_face::Envelope::speakerDefaults());
+voicebot_face::Envelope microphoneEnvelope(voicebot_face::Envelope::microphoneDefaults());
+#if VOICEBOT_DISPLAY_ENABLED
+voicebot_face::FaceDisplay faceDisplay;
+SPIClass faceSpi(VOICEBOT_DISPLAY_SPI_BUS);
+TaskHandle_t faceHandle = nullptr;
+#endif
+uint32_t bootedAt = 0;
 VoicebotClient voicebot;
 voicebot_audio::PcmAssembler ttsAssembler;
 voicebot_audio::ReplyGate replyGate;
@@ -100,6 +123,14 @@ void reportMemory() {
         unsigned(uxTaskGetStackHighWaterMark(playbackHandle)),
         unsigned(uxTaskGetStackHighWaterMark(nullptr)));
   }
+#if VOICEBOT_DISPLAY_ENABLED
+  if (faceHandle) {
+    Serial.printf("[FACE] mood=%u speaker/mic level=%u/%u; minimum unused stack=%u bytes\n",
+        unsigned(faceMood.load()), unsigned(speakerFaceLevel.load()),
+        unsigned(microphoneFaceLevel.load()),
+        unsigned(uxTaskGetStackHighWaterMark(faceHandle)));
+  }
+#endif
 }
 
 void invalidatePlayback() {
@@ -142,6 +173,7 @@ void resetSession() {
   replyGate.reset();
   micSuppressed.store(false);
   micPauseAnnounced = false;
+  transcriptFinalPending.store(false);
   playbackFlow.reset();
   if (micQueue) xQueueReset(micQueue);
   clearPlayback();
@@ -177,10 +209,14 @@ void captureTask(void*) {
       }
     }
     if (!received) {
+      microphoneFaceLevel.store(microphoneEnvelope.decay(now));
       if (now - lastCapture >= 500 || duplexAudio.invalidDmaEvents()) reportAudioFault(2);
       continue;  // Keep the physical Stop button usable after a hardware error.
     }
     lastCapture = now;
+    // Raw capture, before AEC: the listening face should react to the room even
+    // when the cleaned upload stream is mostly silence.
+    microphoneFaceLevel.store(microphoneEnvelope.push(now, block.mic, voicebot_audio::kDuplexSamples));
     if (block.discontinuity) captureDiscontinuities.fetch_add(1);
     const uint32_t epoch = sessionEpoch.load();
     const bool upload = readEpoch == epoch && recordingEpoch.load() == epoch &&
@@ -240,7 +276,11 @@ void playbackTask(void*) {
     // Pack across arbitrary WebSocket boundaries. Only a final partial block
     // with an empty source queue and 20ms input idle is padded by the adapter.
     if (packetizer.full() || partialIdle) {
-      if (duplexAudio.submit(packetizer.data(), packetizer.size(), packetizer.generation())) {
+      const size_t submitted = packetizer.size();
+      if (duplexAudio.submit(packetizer.data(), submitted, packetizer.generation())) {
+        // Measure the samples actually entering I2S, not the network arrival:
+        // with a 16-second speaker queue those differ by far more than a frame.
+        speakerFaceLevel.store(speakerEnvelope.push(millis(), packetizer.data(), submitted));
         // Driver accounting is visible before removing our buffered samples.
         packetizer.reset();
         playbackPartialSamples.store(0);
@@ -253,7 +293,11 @@ void playbackTask(void*) {
     }
     if (!haveFrame) {
       const TickType_t wait = packetizer.size() ? pdMS_TO_TICKS(1) : pdMS_TO_TICKS(20);
-      if (xQueueReceive(spkQueue, &frame, wait) != pdTRUE) { lastProgress = millis(); continue; }
+      if (xQueueReceive(spkQueue, &frame, wait) != pdTRUE) {
+        lastProgress = millis();
+        speakerFaceLevel.store(speakerEnvelope.decay(lastProgress));
+        continue;
+      }
       haveFrame = true;
       offset = 0;
       if (frame.generation != playbackGeneration.load()) { releaseSpeakerFrame(); haveFrame = false; continue; }
@@ -282,6 +326,41 @@ void playbackTask(void*) {
     if (offset == frame.length / 2) { releaseSpeakerFrame(); haveFrame = false; }
   }
 }
+
+// Resolved from state loop() already owns, so the render task never inspects
+// the session, the socket or the playback flow.
+voicebot_face::Mood faceMoodNow(uint32_t now) {
+  using voicebot_face::Mood;
+  if (!ready || !audioHealthy.load()) return Mood::Error;
+  if (static_cast<uint32_t>(now - bootedAt) < voicebot_face::FaceAnimator::defaults().wakeMs) {
+    return Mood::Boot;
+  }
+  if (WiFi.status() != WL_CONNECTED) return Mood::Connecting;
+  if (!sessionIntent.requested()) return Mood::Idle;
+  if (!voicebot.isOpened() || !sessionActive.load()) return Mood::Connecting;
+  if (playbackFlow.micPaused() || voicebot.isReceivingAudio()) return Mood::Speaking;
+  if (transcriptFinalPending.load() &&
+      static_cast<uint32_t>(now - transcriptFinalAt.load()) < FACE_THINKING_MS) {
+    return Mood::Thinking;
+  }
+  return Mood::Listening;
+}
+
+#if VOICEBOT_DISPLAY_ENABLED
+void faceTask(void*) {
+  voicebot_face::FaceAnimator animator;
+  animator.seed(esp_random());
+  animator.reset(millis());
+  for (;;) {
+    const voicebot_face::FaceFrame frame = animator.frame(millis(),
+        static_cast<voicebot_face::Mood>(faceMood.load()),
+        speakerFaceLevel.load(), microphoneFaceLevel.load());
+    // Only changed regions reach SPI, so a talking mouth costs one window.
+    faceDisplay.update(frame);
+    vTaskDelay(pdMS_TO_TICKS(VOICEBOT_DISPLAY_FRAME_MS));
+  }
+}
+#endif
 
 void releaseAudio() {
   // Only used before ready=true; loop() cannot touch partial initialization.
@@ -314,6 +393,26 @@ void setup() {
   pinMode(BUTTON_SESSION, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  bootedAt = millis();
+#if VOICEBOT_DISPLAY_ENABLED
+  // Brought up before the audio allocations: an initialization failure below
+  // latches the Error face instead of leaving a blank screen. The panel needs
+  // no heap of its own, so it cannot take memory from AEC or TLS.
+  const voicebot_face::Ili9341::Pins facePins = {
+      VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN,
+      VOICEBOT_DISPLAY_CS_PIN, VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
+  if (faceDisplay.begin(facePins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ, faceSpi) &&
+      xTaskCreate(faceTask, "face", FACE_STACK_BYTES, nullptr, 1, &faceHandle) == pdPASS) {
+    Serial.printf("[FACE] ILI9341 %dx%d at %uMHz; SCK=%d MOSI=%d DC=%d CS=%d RESET=%d LED=%d.\n",
+        int(faceDisplay.renderer().layout().width), int(faceDisplay.renderer().layout().height),
+        unsigned(VOICEBOT_DISPLAY_SPI_HZ / 1000000), VOICEBOT_DISPLAY_SCK_PIN,
+        VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
+        VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN);
+  } else {
+    faceDisplay.end();
+    Serial.println("[FACE] Display unavailable; the voicebot continues without the face.");
+  }
+#endif
   micQueue = makeAudioQueue(MIC_QUEUE_FRAMES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, &micQueueState, &micStorage);
   size_t speakerFrames = SPK_PSRAM_FRAMES;
   spkQueue = makeAudioQueue(speakerFrames, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, &spkQueueState, &spkStorage);
@@ -371,6 +470,7 @@ void setup() {
       return;
     }
     playbackDrainedValid.store(false);
+    transcriptFinalPending.store(false);  // The reply started; stop looking thoughtful.
     replyGate.onAudio(now);
     if (!fullDuplex) micSuppressed.store(true);
     const bool ok = ttsAssembler.append(pcm, length, generation, [](const AudioFrame& frame) {
@@ -393,6 +493,12 @@ void setup() {
   });
   voicebot.setBotReplyCallback([](const String&) {
     playbackFlow.onEndHint();
+  });
+  voicebot.setUserSttCallback([](const String&, bool isFinal) {
+    // Only the final transcript means the turn is over and a reply is pending.
+    if (!isFinal) return;
+    transcriptFinalAt.store(millis());
+    transcriptFinalPending.store(true);
   });
   voicebot.setOpenedCallback([](const String&) {
     if (!sessionIntent.current(connectionIntent)) {
@@ -489,8 +595,11 @@ void serviceMicrophone() {
 }
 
 void loop() {
-  if (!ready) { delay(1000); return; }
   const uint32_t now = millis();
+  // Published before every early return, so Wi-Fi loss, the NTP wait and a
+  // latched audio fault all reach the face.
+  faceMood.store(static_cast<uint8_t>(faceMoodNow(now)));
+  if (!ready) { delay(1000); return; }
   uint32_t intent = 0;
   if (sessionIntent.consume(intent)) {
     // A newer Start can include a Stop received while TLS was busy. Finish the
