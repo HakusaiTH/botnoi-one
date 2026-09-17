@@ -35,3 +35,10 @@
 #ifndef VOICEBOT_BUTTON_PIN
 #define VOICEBOT_BUTTON_PIN 46
 #endif
+
+// Default: keep recording intent, but pause mic upload while the bot replies.
+// This avoids speaker echo and simultaneous upload/download congestion on S3s
+// without PSRAM. Set to 1 only when full duplex/barge-in is required and tested.
+#ifndef VOICEBOT_FULL_DUPLEX
+#define VOICEBOT_FULL_DUPLEX 0
+#endif

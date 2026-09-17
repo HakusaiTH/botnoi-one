@@ -118,6 +118,9 @@ class WebSocketsClient : protected WebSockets {
     void disableHeartbeat();
 
     bool isConnected(void);
+    // ESP32: zero-timeout TCP writability check, with no receive or reconnect
+    // side effects. False means defer sending and keep pumping loop().
+    bool canSendNow() const;
     String getUrl(void);
 
   protected:

@@ -93,12 +93,14 @@ class VoicebotClient : private WebSocketsClient {
       failConnection("Timed out waiting for session opened", true);
       return;
     }
-    if (opened_ && static_cast<uint32_t>(now - lastPing_) >= kPingIntervalMs) {
+    if (opened_ && static_cast<uint32_t>(now - lastPing_) >= kPingIntervalMs && canSendNow()) {
       if (sendPing()) lastPing_ = now;
     }
   }
 
   bool isOpened() { return running_ && opened_ && WebSocketsClient::isConnected(); }
+  // Advisory zero-timeout readiness; a failed/partial TLS send still closes.
+  bool canSendNow() const { return running_ && opened_ && WebSocketsClient::canSendNow(); }
   bool isReceivingAudio() const { return opened_ && isReceivingBinary(); }
   String getSessionId() const { return sessionId_; }
 

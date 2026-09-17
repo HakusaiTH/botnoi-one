@@ -25,6 +25,9 @@
 #include "WebSockets.h"
 #include "WebSocketsClient.h"
 #include <strings.h>
+#if defined(ESP32)
+#include "WebSocketsWritable.h"
+#endif
 
 WebSocketsClient::WebSocketsClient() {
     _cbEvent             = NULL;
@@ -518,6 +521,15 @@ void WebSocketsClient::setReconnectInterval(unsigned long time) {
 
 bool WebSocketsClient::isConnected(void) {
     return (_client.status == WSC_CONNECTED);
+}
+
+bool WebSocketsClient::canSendNow() const {
+    if(_client.status != WSC_CONNECTED || !_client.tcp) return false;
+#if defined(ESP32)
+    return webSocketsSocketWritable(_client.tcp->fd());
+#else
+    return _client.tcp->connected();
+#endif
 }
 
 /**

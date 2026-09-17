@@ -6,7 +6,7 @@ were normalized to LF.
 
 This copy is specialized for the synchronous ESP32 voicebot client.
 `voicebot.patch` records all differences from those four upstream client files
-and adds `WebSocketsStream.h`. It replaces the old `byteplus.patch` and uses
+and adds `WebSocketsStream.h` and `WebSocketsWritable.h`. It replaces the old `byteplus.patch` and uses
 zero-context diffs so the patch artifact has no trailing whitespace. Apply it
 to LF-normalized upstream sources with `git apply --unidiff-zero voicebot.patch`.
 
@@ -19,6 +19,12 @@ to LF-normalized upstream sources with `git apply --unidiff-zero voicebot.patch`
   space before the next TCP/TLS payload read. Zero capacity pauses reading
   without blocking. `isReceivingBinary()` remains true during unfinished binary
   headers, frames, and fragmented messages so playback can track pending audio.
+- `canSendNow() const` checks ESP32 TCP write readiness with a zero-timeout
+  `select`, without reading from TLS or changing connection state. Check it
+  before removing a microphone packet from its queue or sending a control
+  message. False means continue receiving and try on a later loop. Socket
+  readiness avoids ordinary TCP congestion waits but cannot guarantee that TLS
+  finishes a write immediately; failed/partial writes still close the session.
 - The receiver owns an 8,193-byte text buffer, a 125-byte control buffer, and
   small parser state. Receive uses 640 bytes of stack scratch; transmit uses
   654 bytes. No frame-sized allocation or PSRAM fallback occurs.
@@ -56,6 +62,9 @@ UTF-8/length rejection, disconnect reset, and timeout/clock rollover:
 c++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined \
   ESP-Voicebot/tests/test_websocket_stream.cpp -o /tmp/voicebot-websocket-test
 /tmp/voicebot-websocket-test
+c++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  ESP-Voicebot/tests/test_websocket_writable.cpp -o /tmp/voicebot-writable-test
+/tmp/voicebot-writable-test
 ```
 
 No installed WebSockets library is required for this sketch. Arduino recursively

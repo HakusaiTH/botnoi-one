@@ -6,11 +6,14 @@
 #include <atomic>
 #include <time.h>
 #include <esp_heap_caps.h>
+#include <esp_psram.h>
+#include <esp_system.h>
 #if __has_include("config.local.h")
 #include "config.local.h"
 #endif
 #include "config.example.h"
 #include "audio_pipeline.h"
+#include "microphone_flow.h"
 #include "voicebot_client.h"
 #include "tls_roots.h"
 
@@ -35,6 +38,8 @@ StaticQueue_t micQueueState, spkQueueState;
 uint8_t *micStorage = nullptr, *spkStorage = nullptr;
 TaskHandle_t captureHandle = nullptr, playbackHandle = nullptr;
 std::atomic<bool> sessionActive{false};
+std::atomic<bool> micSuppressed{false};
+std::atomic<uint32_t> micFullDrops{0};
 std::atomic<uint32_t> recordingEpoch{0}, finishingEpoch{0};
 std::atomic<uint32_t> sessionEpoch{1}, playbackGeneration{1};
 std::atomic<uint32_t> pendingSpeakerFrames{0}, playbackStartedGeneration{0};
@@ -42,8 +47,11 @@ std::atomic<uint32_t> audioFault{0};
 VoicebotClient voicebot;
 voicebot_audio::PcmAssembler ttsAssembler;
 voicebot_audio::SilenceTail silenceTail;
+voicebot_audio::ReplyGate replyGate;
+voicebot_audio::MicrophonePacer micPacer;
 bool ready = false, started = false, playbackAnnounced = false;
 uint32_t lastTtsAt = 0, retryAt = 0;
+uint32_t micExpiredDrops = 0, micPausedDrops = 0, maxSocketMs = 0, maxMicSendMs = 0;
 
 QueueHandle_t makeAudioQueue(size_t count, uint32_t caps, StaticQueue_t* state, uint8_t** storage) {
   *storage = static_cast<uint8_t*>(heap_caps_malloc(count * sizeof(AudioFrame), caps));
@@ -59,6 +67,10 @@ void reportMemory() {
       unsigned(heap_caps_get_free_size(caps)), unsigned(heap_caps_get_minimum_free_size(caps)),
       unsigned(heap_caps_get_largest_free_block(caps)),
       unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)), unsigned(pendingSpeakerFrames.load()));
+  Serial.printf("[FLOW] mic queued=%u dropped(full/old)=%u/%u paused=%s; max socket=%ums send=%ums\n",
+      unsigned(micQueue ? uxQueueMessagesWaiting(micQueue) : 0), unsigned(micFullDrops.load()),
+      unsigned(micExpiredDrops), micSuppressed.load() ? "yes" : "no",
+      unsigned(maxSocketMs), unsigned(maxMicSendMs));
   if (captureHandle && playbackHandle) {
     Serial.printf("[STACK] minimum unused bytes: capture=%u playback=%u loop=%u\n",
         unsigned(uxTaskGetStackHighWaterMark(captureHandle)),
@@ -82,6 +94,9 @@ void resetSession() {
   finishingEpoch.store(0);
   digitalWrite(LED_PIN, LOW);
   silenceTail.reset();
+  micPacer.reset();
+  replyGate.reset();
+  micSuppressed.store(false);
   if (micQueue) xQueueReset(micQueue);
   clearPlayback();
 }
@@ -93,7 +108,9 @@ void stopRecording(uint32_t epoch) {
   AudioFrame end{};
   end.generation = epoch;
   // Capture always reserves one queue slot for this ordered end marker.
-  if (xQueueSend(micQueue, &end, 0) != pdTRUE) audioFault.store(1);
+  if (!voicebot_audio::enqueueMicrophone(end,
+      []() { return uxQueueSpacesAvailable(micQueue); },
+      [](const AudioFrame& frame) { return xQueueSend(micQueue, &frame, 0) == pdTRUE; })) audioFault.store(5);
   Serial.println("[MIC] Recording OFF; finishing this turn.");
 }
 
@@ -104,7 +121,7 @@ void captureTask(void*) {
   AudioFrame frame{};
   for (;;) {
     const uint32_t readEpoch = sessionEpoch.load();
-    const bool recordThisRead = recordingEpoch.load() == readEpoch && sessionActive.load();
+    const bool recordThisRead = recordingEpoch.load() == readEpoch && sessionActive.load() && !micSuppressed.load();
     size_t received = 0;
     const esp_err_t status = i2s_channel_read(microphone.rxChan(), raw, sizeof(raw), &received, 30);
     const uint32_t now = millis();
@@ -119,20 +136,22 @@ void captureTask(void*) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
-    if (recordThisRead && sessionActive.load() && readEpoch == epoch && received) {
+    if (recordThisRead && sessionActive.load() && !micSuppressed.load() && readEpoch == epoch && received) {
       const size_t samples = received / sizeof(int32_t);
       frame.generation = epoch;
+      frame.capturedAt = now;
       frame.length = samples * sizeof(int16_t);
       for (size_t i = 0; i < samples; ++i) {
         const int16_t sample = static_cast<int16_t>(raw[i] >> 16);
         frame.pcm[2 * i] = static_cast<uint8_t>(sample);
         frame.pcm[2 * i + 1] = static_cast<uint8_t>(static_cast<uint16_t>(sample) >> 8);
       }
-      if (frame.length && (uxQueueSpacesAvailable(micQueue) <= 1 || xQueueSend(micQueue, &frame, 0) != pdTRUE)) {
-        // Do not silently splice speech after a slow/failed network write.
-        recordingEpoch.store(0);
-        digitalWrite(LED_PIN, LOW);
-        audioFault.store(1);
+      if (frame.length && !voicebot_audio::enqueueMicrophone(frame,
+          []() { return uxQueueSpacesAvailable(micQueue); },
+          [](const AudioFrame& packet) { return xQueueSend(micQueue, &packet, 0) == pdTRUE; })) {
+        // A short upload stall is recoverable. Keep the session/recording intent
+        // and reserve the end-marker slot. The loop expires old queued speech.
+        micFullDrops.fetch_add(1);
       }
     }
     const int reading = digitalRead(BUTTON_TALK);
@@ -146,7 +165,8 @@ void captureTask(void*) {
                  finishingEpoch.load() != epoch && !audioFault.load()) {
           recordingEpoch.store(epoch);
           digitalWrite(LED_PIN, HIGH);
-          Serial.println("[MIC] Recording ON. Tap again to finish.");
+          Serial.println(micSuppressed.load() ? "[MIC] Recording ON; listening resumes after the bot reply."
+                                            : "[MIC] Recording ON. Tap again to finish.");
         } else Serial.println("[MIC] Wait for the session/previous turn to be ready.");
       }
     }
@@ -201,6 +221,18 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\nESP-Voicebot: bounded streaming audio for ESP32-S3");
+  Serial.printf("[BOOT] reset reason=%d (1=power-on, 3=software, 4=panic, 5/6/7=watchdog, 9=brownout)\n",
+      int(esp_reset_reason()));
+#ifdef BOARD_HAS_PSRAM
+  constexpr bool psramRequested = true;
+#else
+  constexpr bool psramRequested = false;
+#endif
+  Serial.printf("[PSRAM] build enabled=%s initialized=%s total=%u free=%u largest=%u\n",
+      psramRequested ? "yes" : "no", esp_psram_is_initialized() ? "yes" : "no",
+      unsigned(ESP.getPsramSize()), unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+      unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+  Serial.printf("[MIC] %s\n", VOICEBOT_FULL_DUPLEX ? "Full duplex enabled." : "Mic pauses during bot replies and resumes automatically.");
   pinMode(BUTTON_TALK, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -238,6 +270,8 @@ void setup() {
   });
   voicebot.setTtsAudioCallback([](const uint8_t* pcm, size_t length) {
     lastTtsAt = millis();
+    replyGate.onAudio(lastTtsAt);
+    if (!VOICEBOT_FULL_DUPLEX) micSuppressed.store(true);
     const bool ok = ttsAssembler.append(pcm, length, playbackGeneration.load(), [](const AudioFrame& frame) {
       pendingSpeakerFrames.fetch_add(1);
       if (xQueueSend(spkQueue, &frame, 0) == pdTRUE) return true;
@@ -249,6 +283,10 @@ void setup() {
   voicebot.setBargeInCallback([]() {
     clearPlayback();
     Serial.println("[BARGE_IN] Queued playback cancelled.");
+  });
+  voicebot.setBotReplyCallback([](const String&) {
+    replyGate.onReplyText(millis());
+    if (!VOICEBOT_FULL_DUPLEX) micSuppressed.store(true);
   });
   voicebot.setOpenedCallback([](const String&) {
     resetSession();
@@ -276,28 +314,74 @@ void abortConnection(const char* reason) {
 
 void serviceMicrophone() {
   if (!voicebot.isOpened()) return;
+  const bool pause = !VOICEBOT_FULL_DUPLEX && replyGate.paused(
+      millis(), voicebot.isReceivingAudio(), pendingSpeakerFrames.load() != 0);
+  micSuppressed.store(pause);
+  static bool announcedPause = false;
+  if (pause != announcedPause) {
+    announcedPause = pause;
+    if (recordingEpoch.load() == sessionEpoch.load()) {
+      Serial.println(pause ? "[MIC] Paused during bot reply; recording stays ON."
+                           : "[MIC] Listening resumed.");
+    }
+  }
+  AudioFrame frame;
+  if (pause) {
+    // The server already began its reply. Do not send buffered echo, or pad the
+    // previous turn while its downlink is backpressured. Still acknowledge stop
+    // markers, so a stop tap cannot leave finishingEpoch stuck.
+    if (silenceTail.active()) {
+      silenceTail.reset();
+      finishingEpoch.store(0);
+    }
+    for (size_t i = 0; i < MIC_QUEUE_FRAMES && xQueueReceive(micQueue, &frame, 0) == pdTRUE; ++i) {
+      if (frame.generation != sessionEpoch.load()) continue;
+      if (!frame.length) finishingEpoch.store(0);
+      else ++micPausedDrops;
+    }
+    micPacer.reset();
+    return;
+  }
   if (silenceTail.active()) {
     const uint32_t now = millis();
-    if (silenceTail.due(now)) {
+    if (silenceTail.due(now) && voicebot.canSendNow()) {
       static const uint8_t silence[FRAME_BYTES] = {};
+      const uint32_t sendAt = millis();
       if (!voicebot.sendAudioFrame(silence, sizeof(silence))) {
         abortConnection("Silence send failed");
         return;
       }
+      maxMicSendMs = max(maxMicSendMs, uint32_t(millis() - sendAt));
       silenceTail.sent(millis());
       if (!silenceTail.active()) finishingEpoch.store(0);
     }
     return;
   }
-  AudioFrame frame;
-  // Bound work so downlink, controls and keepalive keep progressing.
-  for (size_t i = 0; i < 2 && xQueueReceive(micQueue, &frame, 0) == pdTRUE; ++i) {
-    if (frame.generation != sessionEpoch.load()) continue;
-    if (!frame.length) { silenceTail.start(millis()); break; }
+  // Peek before consuming: a congested socket is not an audio/session error.
+  // Discard expired speech after a stall instead of sending it as a catch-up
+  // burst. End markers are handled before age checks and remain ordered.
+  for (size_t i = 0; i < MIC_QUEUE_FRAMES && xQueuePeek(micQueue, &frame, 0) == pdTRUE; ++i) {
+    if (frame.generation != sessionEpoch.load()) { xQueueReceive(micQueue, &frame, 0); continue; }
+    if (!frame.length) {
+      xQueueReceive(micQueue, &frame, 0);
+      silenceTail.start(millis());
+      break;
+    }
+    if (voicebot_audio::microphoneFrameExpired(millis(), frame.capturedAt)) {
+      xQueueReceive(micQueue, &frame, 0);
+      ++micExpiredDrops;
+      continue;
+    }
+    if (!micPacer.due(millis()) || !voicebot.canSendNow()) break;
+    xQueueReceive(micQueue, &frame, 0);
+    const uint32_t sendAt = millis();
     if (!voicebot.sendAudioFrame(frame.pcm, frame.length)) {
       abortConnection("Microphone send failed");
       break;
     }
+    maxMicSendMs = max(maxMicSendMs, uint32_t(millis() - sendAt));
+    micPacer.sent(millis(), frame.length);
+    break;  // At most one PCM packet per duration; no post-stall upload burst.
   }
 }
 
@@ -305,12 +389,19 @@ void loop() {
   if (!ready) { delay(1000); return; }
   const uint32_t fault = audioFault.exchange(0);
   if (fault) {
-    Serial.printf("[AUDIO] fault=%u (1=mic backlog, 2=mic I2S, 3=speaker I2S, 4=TTS queue).\n", unsigned(fault));
+    Serial.printf("[AUDIO] fault=%u (2=mic I2S, 3=speaker I2S, 4=TTS queue, 5=mic end marker).\n", unsigned(fault));
     abortConnection("Audio pipeline stopped");
   }
   const uint32_t now = millis();
   static uint32_t lastReport = 0, lastWifiRetry = 0;
   if (now - lastReport >= 30000) { lastReport = now; reportMemory(); }
+  static uint32_t lastDropNotice = 0, reportedDrops = 0;
+  const uint32_t dropped = micFullDrops.load() + micExpiredDrops;
+  if (dropped != reportedDrops && now - lastDropNotice >= 5000) {
+    lastDropNotice = now;
+    reportedDrops = dropped;
+    Serial.printf("[MIC] Upload backlog: dropped %u frames total; keeping session.\n", unsigned(dropped));
+  }
   if (WiFi.status() != WL_CONNECTED) {
     if (started) abortConnection("Wi-Fi lost");
     if (now - lastWifiRetry >= 15000) { lastWifiRetry = now; WiFi.reconnect(); }
@@ -340,14 +431,17 @@ void loop() {
     }
   }
   if (started) {
+    const uint32_t socketAt = millis();
     voicebot.loop();
+    maxSocketMs = max(maxSocketMs, uint32_t(millis() - socketAt));
     serviceMicrophone();
     if (voicebot.isOpened()) {
-      if (!playbackAnnounced && playbackStartedGeneration.load() == playbackGeneration.load()) {
+      if (!playbackAnnounced && playbackStartedGeneration.load() == playbackGeneration.load() && voicebot.canSendNow()) {
         if (voicebot.sendPlaybackStarted()) playbackAnnounced = true;
         else abortConnection("Playback notification failed");
       }
-      if (playbackAnnounced && !pendingSpeakerFrames.load() && !voicebot.isReceivingAudio() && millis() - lastTtsAt >= 400) {
+      if (playbackAnnounced && !pendingSpeakerFrames.load() && !voicebot.isReceivingAudio() &&
+          millis() - lastTtsAt >= 400 && voicebot.canSendNow()) {
         if (!voicebot.sendPlaybackCompleted()) abortConnection("Playback notification failed");
         playbackAnnounced = false;
         playbackStartedGeneration.store(0);

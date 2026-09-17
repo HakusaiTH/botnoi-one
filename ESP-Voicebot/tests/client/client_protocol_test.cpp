@@ -32,6 +32,7 @@ class WebSocketsClient {
   void setReconnectInterval(unsigned long interval) { reconnectInterval = interval; }
   void loop() { loopCount++; }
   bool isConnected() { return connected; }
+  bool canSendNow() const { return connected && writable; }
   void disconnect() {
     disconnectCount++;
     if (connected) {
@@ -40,12 +41,12 @@ class WebSocketsClient {
     }
   }
   bool sendBIN(const uint8_t* pcm, size_t length) {
-    if (!sendSucceeds) return false;
+    if (!sendSucceeds || !writable) return false;
     binary.emplace_back(pcm, pcm + length);
     return true;
   }
   bool sendTXT(char* text, size_t length) {
-    if (!sendSucceeds) return false;
+    if (!sendSucceeds || !writable) return false;
     messages.emplace_back(text, length);
     return true;
   }
@@ -60,6 +61,7 @@ class WebSocketsClient {
   bool connected = false;
   bool receivingBinary = false;
   bool sendSucceeds = true;
+  bool writable = true;
   unsigned beginCount = 0, loopCount = 0, disconnectCount = 0;
   unsigned long reconnectInterval = 0;
   std::string url;
@@ -194,6 +196,31 @@ static void testOpenedTimeoutAndMillisRollover() {
   assert(document["type"] == "ping");
 }
 
+static void testPingDefersWhileTransportIsFull() {
+  VoicebotClient client;
+  unsigned disconnects = 0;
+  client.setDisconnectCallback([&](const String&) { disconnects++; });
+  connect(client);
+  assert(client.canSendNow());
+  ws().writable = false;
+  assert(!client.canSendNow());
+  fakeMillis += 20000;
+  client.loop();
+  fakeMillis += 20000;
+  client.loop();
+  assert(client.isOpened() && ws().connected && disconnects == 0);
+  assert(ws().messages.empty());
+  ws().writable = true;
+  fakeMillis++;
+  client.loop();
+  assert(client.isOpened() && disconnects == 0 && ws().messages.size() == 1);
+  JsonDocument document;
+  assert(!deserializeJson(document, ws().messages.back()));
+  assert(document["type"] == "ping");
+  client.loop();
+  assert(ws().messages.size() == 1);
+}
+
 static void testUnsupportedOpenedRejected() {
   const std::vector<std::pair<std::string, std::string>> changes = {
     {"16000", "24000"}, {"session-001", ""},
@@ -289,6 +316,7 @@ int main() {
   testSessionAndOutboundPackets();
   testFailureClearsAndReconnectResetsSession();
   testOpenedTimeoutAndMillisRollover();
+  testPingDefersWhileTransportIsFull();
   testUnsupportedOpenedRejected();
   testSendFailureClosesSession();
   testBoundedJsonAndArenaReuse();

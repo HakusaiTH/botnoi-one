@@ -7,6 +7,7 @@ namespace voicebot_audio {
 constexpr size_t kFrameBytes = 640;
 struct AudioFrame {
   uint32_t generation;
+  uint32_t capturedAt;  // Microphone only: discard stale PCM after congestion.
   uint16_t length;  // Zero marks the end of a microphone turn.
   uint8_t pcm[kFrameBytes];
 };

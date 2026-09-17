@@ -546,24 +546,27 @@
 -    bool readCb(WSclient_t * client, uint8_t * out, size_t n, WSreadWaitCb cb);
 --- a/WebSocketsClient.cpp
 +++ b/WebSocketsClient.cpp
-@@ -26,0 +27 @@
+@@ -26,0 +27,4 @@
 +#include <strings.h>
-@@ -35,0 +37,4 @@
++#if defined(ESP32)
++#include "WebSocketsWritable.h"
++#endif
+@@ -35,0 +40,4 @@
 +#if defined(HAS_SSL) && defined(SSL_AXTLS)
 +    _client_cert = NULL;
 +    _client_key = NULL;
 +#endif
-@@ -45,0 +51,5 @@
+@@ -45,0 +54,5 @@
 +    if(_client.tcp) clientDisconnect(&_client, "Restarting connection");
 +    _client.rx.reset();
 +    _client.rxBackpressured = false;
 +    _client.httpLine = "";
 +    _client.httpHeaderBytes = 0;
-@@ -161,0 +172,3 @@
+@@ -161,0 +175,3 @@
 +#if defined(ESP32)
 +    _CA_bundle    = NULL;
 +#endif
-@@ -262,0 +276,9 @@
+@@ -262,0 +279,9 @@
 +            if(!_client.ssl) {
 +                _lastConnectionFail = millis();
 +                return;
@@ -573,7 +576,7 @@
 +            _client.ssl->setHandshakeTimeout(8);
 +            _client.ssl->setTimeout(WEBSOCKETS_TCP_TIMEOUT);
 +#endif
-@@ -345,2 +367,7 @@
+@@ -345,2 +370,7 @@
 -            handleHBPing();
 -            handleHBTimeout(&_client);
 +            if(_client.rxBackpressured) {
@@ -583,13 +586,23 @@
 +                handleHBPing();
 +                handleHBTimeout(&_client);
 +            }
-@@ -559,4 +586 @@
+@@ -493,0 +524,9 @@
++}
++
++bool WebSocketsClient::canSendNow() const {
++    if(_client.status != WSC_CONNECTED || !_client.tcp) return false;
++#if defined(ESP32)
++    return webSocketsSocketWritable(_client.tcp->fd());
++#else
++    return _client.tcp->connected();
++#endif
+@@ -559,4 +598 @@
 -        if(client->ssl->connected()) {
 -            client->ssl->flush();
 -            client->ssl->stop();
 -        }
 +        client->ssl->stop();
-@@ -571,6 +595 @@
+@@ -571,6 +607 @@
 -        if(client->tcp->connected()) {
 -#if (WEBSOCKETS_NETWORK_TYPE != NETWORK_ESP8266_ASYNC)
 -            client->tcp->flush();
@@ -597,26 +610,26 @@
 -            client->tcp->stop();
 -        }
 +        client->tcp->stop();
-@@ -596,0 +616,4 @@
+@@ -596,0 +628,4 @@
 +    client->rx.reset();
 +    client->rxBackpressured = false;
 +    client->httpLine = "";
 +    client->httpHeaderBytes = 0;
-@@ -621 +644,3 @@
+@@ -621 +656,3 @@
 -    if(client->tcp->connected()) {
 +    // Drain already received bytes before EOF cleanup, including a final
 +    // continuation delivered together with the peer's TCP FIN.
 +    if(client->tcp->available() > 0 || client->tcp->connected()) {
-@@ -634,5 +658,0 @@
+@@ -634,5 +670,0 @@
 -    if(client->tcp) {
 -        // do cleanup
 -        clientDisconnect(client, "TCP connection cleanup");
 -    }
 -
-@@ -646 +666 @@
+@@ -646 +678 @@
 -    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && _lastHeaderSent + WEBSOCKETS_TCP_TIMEOUT < millis()) {
 +    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && uint32_t(millis() - _lastHeaderSent) > WEBSOCKETS_TCP_TIMEOUT) {
-@@ -653,15 +673,18 @@
+@@ -653,15 +685,18 @@
 -    int len = _client.tcp->available();
 -    if(len > 0) {
 -        switch(_client.status) {
@@ -650,7 +663,7 @@
 +                String line = _client.httpLine;
 +                _client.httpLine = "";
 +                handleHeader(&_client, &line);
-@@ -669,3 +692,5 @@
+@@ -669,3 +704,5 @@
 -            default:
 -                WebSockets::clientDisconnect(&_client, 1002);
 -                break;
@@ -659,14 +672,14 @@
 +                clientDisconnect(&_client, "HTTP response allocation failed");
 +                return;
 +            }
-@@ -688 +713,3 @@
+@@ -688 +725,3 @@
 -
 +#if defined(ESP32)
 +    esp_fill_random(randomKey, sizeof(randomKey));
 +#else
-@@ -691,0 +719 @@
+@@ -691,0 +731 @@
 +#endif
-@@ -745 +773,8 @@
+@@ -745 +785,8 @@
 -    handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
 +    bool hasUserAgent = false;
 +    const char * extraLine = client->extraHeaders.c_str();
@@ -676,13 +689,13 @@
 +        if(extraLine) ++extraLine;
 +    }
 +    if(!hasUserAgent) handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
-@@ -760 +795,4 @@
+@@ -760 +807,4 @@
 -    write(client, (uint8_t *)handshake.c_str(), handshake.length());
 +    if(write(client, (uint8_t *)handshake.c_str(), handshake.length()) != handshake.length()) {
 +        clientDisconnect(client, "HTTP handshake write failed");
 +        return;
 +    }
-@@ -989,0 +1028 @@
+@@ -989,0 +1040 @@
 +    clientDisconnect(&_client, "Connection failed");
 --- a/WebSocketsClient.h
 +++ b/WebSocketsClient.h
@@ -692,7 +705,11 @@
 +    // contain <=640 bytes; fragmented text is assembled with an 8192-byte cap.
 +    void setBinaryReceiveCapacity(std::function<size_t()> cb) { _binaryCapacity = cb; }
 +    bool isReceivingBinary() const { return _client.rx.isReceivingBinary(); }
-@@ -155,0 +161,2 @@
+@@ -115,0 +121,3 @@
++    // ESP32: zero-timeout TCP writability check, with no receive or reconnect
++    // side effects. False means defer sending and keep pumping loop().
++    bool canSendNow() const;
+@@ -155,0 +164,2 @@
 +    std::function<size_t()> _binaryCapacity;
 +    size_t binaryReceiveCapacity() override { return _binaryCapacity ? _binaryCapacity() : SIZE_MAX; }
 --- /dev/null
@@ -894,5 +911,37 @@
 +    bool payload_ = false;
 +    bool fin_ = false;
 +};
++
++#endif
+--- /dev/null
++++ b/WebSocketsWritable.h
+@@ -0,0 +1,29 @@
++/* Nonblocking TCP readiness for the local LGPL-2.1 WebSocket client fork. */
++#ifndef WEBSOCKETS_WRITABLE_H_
++#define WEBSOCKETS_WRITABLE_H_
++
++#if defined(ESP32)
++#include <lwip/sockets.h>
++#else
++#include <sys/select.h>
++#endif
++
++// Check before dequeuing application audio. A full send buffer is ordinary
++// backpressure: leave the frame queued and continue servicing receive/audio.
++// Readiness avoids the common congested write, but is not a TLS completion
++// guarantee. No connection state is changed on a select error or a closed fd.
++inline bool webSocketsSocketWritable(int socketFd) {
++#if defined(LWIP_SELECT_MAXNFDS)
++    if(socketFd < LWIP_SOCKET_OFFSET || socketFd >= LWIP_SELECT_MAXNFDS) return false;
++#else
++    if(socketFd < 0 || socketFd >= FD_SETSIZE) return false;
++#endif
++    fd_set writable;
++    FD_ZERO(&writable);
++    FD_SET(socketFd, &writable);
++    timeval timeout = { 0, 0 };
++    const int result = select(socketFd + 1, nullptr, &writable, nullptr, &timeout);
++    return result > 0 && FD_ISSET(socketFd, &writable);
++}
 +
 +#endif
