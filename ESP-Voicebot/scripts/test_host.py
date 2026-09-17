@@ -18,7 +18,7 @@ def main():
     flags = ['-std=c++11', '-Wall', '-Wextra', '-Werror', '-g',
              '-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     with tempfile.TemporaryDirectory(prefix='esp-voicebot-tests-') as tmp:
-        for name in ('test_audio_pipeline', 'test_microphone_flow', 'test_websocket_stream', 'test_websocket_writable'):
+        for name in ('test_audio_pipeline', 'test_microphone_flow', 'test_playback_flow', 'test_session_flow', 'test_websocket_stream', 'test_websocket_writable'):
             binary = Path(tmp) / name
             subprocess.run([compiler, *flags, str(sketch / 'tests' / (name + '.cpp')), '-o', str(binary)], check=True)
             subprocess.run([str(binary)], check=True)

@@ -13,6 +13,15 @@
 // PCM and playback notifications through queues; they must never call the socket.
 class VoicebotClient : private WebSocketsClient {
  public:
+  enum class FailureReason : uint8_t {
+    None, Network, Timeout, ServerError, ServerCompleted, Unauthorized, Protocol, Resource
+  };
+  FailureReason failureReason() const { return failureReason_; }
+  bool retryableDisconnect() const {
+    return failureReason_ == FailureReason::Network || failureReason_ == FailureReason::Timeout ||
+           failureReason_ == FailureReason::ServerError || failureReason_ == FailureReason::Resource;
+  }
+
   using TtsAudioCallback = std::function<void(const uint8_t* pcm, size_t length)>;
   using TtsAudioCapacityCallback = std::function<size_t()>;
   using OpenedCallback = std::function<void(const String& sessionId)>;
@@ -44,10 +53,12 @@ class VoicebotClient : private WebSocketsClient {
   bool start(const char* host, uint16_t port, const char* path,
              const char* apiKey, const char* agentId, const char* ca) {
     stop();
+    failureReason_ = FailureReason::None;
     if (!validHost(host) || !port || !path || path[0] != '/' ||
         strnlen(path, 513) > 512 || strchr(path, '\r') || strchr(path, '\n') ||
         !apiKey || !*apiKey || strnlen(apiKey, 513) > 512 ||
         !agentId || !*agentId || strnlen(agentId, 129) > 128) {
+      failureReason_ = FailureReason::Protocol;
       Serial.println("[Voicebot] Invalid endpoint or missing credentials.");
       return false;
     }
@@ -55,13 +66,17 @@ class VoicebotClient : private WebSocketsClient {
     // The CA storage must outlive the connection (tls_roots.h is static flash).
     if (!ca || !strstr(ca, "-----BEGIN CERTIFICATE-----") ||
         !strstr(ca, "-----END CERTIFICATE-----")) {
+      failureReason_ = FailureReason::Protocol;
       Serial.println("[Voicebot] A valid TLS root certificate is required.");
       return false;
     }
 
     String urlPath;
     const size_t capacity = strlen(path) + 3 * (strlen(apiKey) + strlen(agentId)) + 24;
-    if (!urlPath.reserve(capacity)) return false;
+    if (!urlPath.reserve(capacity)) {
+      failureReason_ = FailureReason::Resource;
+      return false;
+    }
     urlPath += path;
     urlPath += strchr(path, '?') ? "&api_key=" : "?api_key=";
     appendQueryValue(urlPath, apiKey);
@@ -115,12 +130,14 @@ class VoicebotClient : private WebSocketsClient {
       serviceClose(now);
       return;
     }
+    updateReceiveProgress(now);
     if (awaitingOpened_ && static_cast<uint32_t>(now - connectedAt_) >= kOpenedTimeoutMs) {
-      failConnection("Timed out waiting for session opened", true);
+      failConnection("Timed out waiting for session opened", true, FailureReason::Timeout);
       return;
     }
+    if (opened_ && !serviceLiveness(now)) return;
     if (opened_ && static_cast<uint32_t>(now - lastPing_) >= kPingIntervalMs && canSendNow()) {
-      if (sendPing()) lastPing_ = now;
+      sendPing();
     }
   }
 
@@ -136,23 +153,34 @@ class VoicebotClient : private WebSocketsClient {
     // Microphone packets are continuous 20 ms PCM16 mono, 640 bytes at 16 kHz.
     if (!isOpened() || !pcm || !length || length > 640 || (length & 1)) return false;
     if (sendBIN(pcm, length)) return true;
-    failConnection("Audio send failed", true);
+    if (running_) failConnection("Audio send failed", true, FailureReason::Network);
     return false;
   }
 
-  bool sendPing() { return sendJson("ping"); }
+  bool sendPing() {
+    if (!sendJson("ping")) return false;
+    if (!pingOutstanding_) pendingPingAt_ = millis();
+    pingOutstanding_ = true;
+    pendingPingSeq_ = seq_;
+    lastPing_ = millis();
+    return true;
+  }
   bool sendPlaybackStarted() { return sendJson("playback_started"); }
   bool sendPlaybackCompleted() { return sendJson("playback_completed"); }
 
  private:
   static constexpr size_t kMaxJsonBytes = 8192;
-  static constexpr size_t kJsonArenaBytes = 8192;
+  // A 7000-byte string needs ArduinoJson's 8191-byte growing string buffer
+  // plus object/array nodes. This fixed budget supports the 8 KiB wire limit.
+  static constexpr size_t kJsonArenaBytes = 12 * 1024;
   static constexpr size_t kMaxSessionIdBytes = 128;
   static constexpr size_t kMaxDisplayTextBytes = 2048;
   static constexpr size_t kMaxLogTextBytes = 256;
   static constexpr size_t kLogBudgetPerMessage = 512;
   static constexpr uint32_t kOpenedTimeoutMs = 15000;
   static constexpr uint32_t kPingIntervalMs = 20000;
+  static constexpr uint32_t kNoInboundTimeoutMs = 60000;
+  static constexpr uint32_t kPingResponseGraceMs = 10000;
   static constexpr uint32_t kCloseDrainMs = 300;
   static constexpr uint32_t kCloseSendTimeoutMs = 1000;
 
@@ -209,6 +237,7 @@ class VoicebotClient : private WebSocketsClient {
     size_t used_ = 0;
   } jsonArena_;
 
+  FailureReason failureReason_ = FailureReason::None;
   bool running_ = false;
   bool opened_ = false;
   bool awaitingOpened_ = false;
@@ -221,6 +250,14 @@ class VoicebotClient : private WebSocketsClient {
   uint32_t connectedAt_ = 0;
   uint32_t closeRequestedAt_ = 0;
   uint32_t closeSentAt_ = 0;
+  uint32_t lastInboundAt_ = 0;
+  uint32_t observedReceiveProgress_ = 0;
+  uint32_t pendingPingAt_ = 0;
+  uint32_t pendingPingSeq_ = 0;
+  uint32_t writeBlockedAt_ = 0;
+  bool pingOutstanding_ = false;
+  bool writeBlocked_ = false;
+  bool receiveWasBackpressured_ = false;
 
   TtsAudioCallback onTtsAudio_;
   OpenedCallback onOpened_;
@@ -253,8 +290,11 @@ class VoicebotClient : private WebSocketsClient {
     }
   }
 
-  static bool validSessionId(const char* id) {
-    if (!id || !*id || strnlen(id, kMaxSessionIdBytes + 1) > kMaxSessionIdBytes) return false;
+  static bool validSessionId(JsonVariantConst value) {
+    const JsonString encoded = value.as<JsonString>();
+    const char* id = encoded.c_str();
+    if (!id || !encoded.size() || encoded.size() > kMaxSessionIdBytes ||
+        encoded.size() != strlen(id)) return false;
     for (const char* p = id; *p; ++p) {
       // These protocol identifiers need no escaping in the fixed JSON envelope.
       if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
@@ -280,13 +320,49 @@ class VoicebotClient : private WebSocketsClient {
     seq_ = 0;
     connectedAt_ = 0;
     lastPing_ = 0;
+    lastInboundAt_ = millis();
+    observedReceiveProgress_ = receiveProgress();
+    pendingPingAt_ = 0;
+    pendingPingSeq_ = 0;
+    writeBlockedAt_ = 0;
+    pingOutstanding_ = false;
+    writeBlocked_ = false;
+    receiveWasBackpressured_ = false;
   }
 
-  void failConnection(const char* reason, bool closeSocket) {
+  void updateReceiveProgress(uint32_t now) {
+    const uint32_t progress = receiveProgress();
+    const bool paused = isReceiveBackpressured();
+    if (progress != observedReceiveProgress_ || paused || receiveWasBackpressured_) lastInboundAt_ = now;
+    observedReceiveProgress_ = progress;
+    receiveWasBackpressured_ = paused;
+  }
+
+  bool serviceLiveness(uint32_t now) {
+    if (canSendNow()) {
+      writeBlocked_ = false;
+    } else if (!writeBlocked_) {
+      writeBlocked_ = true;
+      writeBlockedAt_ = now;
+    }
+    const bool waitingForPong = pingOutstanding_ &&
+        static_cast<uint32_t>(now - pendingPingAt_) >= kPingResponseGraceMs;
+    const bool stalledWrite = writeBlocked_ &&
+        static_cast<uint32_t>(now - writeBlockedAt_) >= kNoInboundTimeoutMs;
+    if (static_cast<uint32_t>(now - lastInboundAt_) >= kNoInboundTimeoutMs &&
+        (waitingForPong || stalledWrite)) {
+      failConnection("No inbound progress from the voice service", true, FailureReason::Timeout);
+      return false;
+    }
+    return true;
+  }
+
+  void failConnection(const char* reason, bool closeSocket,
+                      FailureReason failure = FailureReason::Protocol) {
     const bool notify = running_ && !disconnectNotified_;
-    // A transport reconnect would create a different server-side session and
-    // silently lose the current conversation context. End this call instead;
-    // the application can explicitly start a new one after another button tap.
+    // Stop this transport before notifying the owner. Only the application
+    // decides whether user intent permits a retry; a retry creates a new id.
+    failureReason_ = failure;
     running_ = false;
     disconnectNotified_ = true;
     closeRequested_ = false;
@@ -315,7 +391,7 @@ class VoicebotClient : private WebSocketsClient {
         type, static_cast<unsigned long>(nextSeq), sessionId_.c_str());
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(envelope)) return false;
     if (!sendTXT(envelope, static_cast<size_t>(length))) {
-      failConnection("Control send failed", true);
+      if (running_) failConnection("Control send failed", true, FailureReason::Network);
       return false;
     }
     seq_ = nextSeq;
@@ -372,18 +448,20 @@ class VoicebotClient : private WebSocketsClient {
       case WStype_DISCONNECTED:
         // Transport reasons may contain a request URL: use a safe fixed message.
         if (closeRequested_) stop();
-        else failConnection("WebSocket disconnected", false);
+        else handleTransportFailure(false);
         break;
       case WStype_ERROR:
         if (closeRequested_) stop();
-        else failConnection("WebSocket error", true);
+        else handleTransportFailure(true);
         break;
       case WStype_BIN:
+        if (bytes && length) lastInboundAt_ = millis();
         // The bounded transport emits chunks for both ordinary and fragmented
         // binary messages, including their final bytes. Text never reaches here.
         if (opened_ && !closeRequested_ && onTtsAudio_ && bytes && length) onTtsAudio_(bytes, length);
         break;
       case WStype_TEXT:
+        if (bytes && length) lastInboundAt_ = millis();
         if (!bytes || !length || length > kMaxJsonBytes) {
           failConnection("Invalid JSON message size", true);
           break;
@@ -393,6 +471,37 @@ class VoicebotClient : private WebSocketsClient {
       default:
         break;
     }
+  }
+
+  void handleTransportFailure(bool closeSocket) {
+    const uint16_t code = lastCloseCode();
+    if (code == 1008) {
+      failConnection("Server rejected session authorization or policy", closeSocket, FailureReason::Unauthorized);
+    } else if (code == 1000 && opened_) {
+      failConnection("Server completed the session", closeSocket, FailureReason::ServerCompleted);
+    } else if (code == 1011) {
+      failConnection("Server reported an upstream error", closeSocket, FailureReason::ServerError);
+    } else if (code == 1002 || code == 1003 || code == 1007 || code == 1009) {
+      failConnection("WebSocket protocol or payload limit error", closeSocket, FailureReason::Protocol);
+    } else {
+      failConnection("WebSocket connection lost", closeSocket, FailureReason::Network);
+    }
+  }
+
+  // Legacy bare events remain supported. When an envelope identifies itself,
+  // apply it only to this version/session; never let stale closed/events affect
+  // the current call. JsonString compares length, including embedded NUL bytes.
+  bool matchesSessionEnvelope(const JsonDocument& doc) const {
+    if (!doc["version"].isUnbound() && doc["version"] != "2") return false;
+    if (!doc["id"].isUnbound()) {
+      const JsonString id = doc["id"].as<JsonString>();
+      if (!id.c_str() || id.size() > kMaxSessionIdBytes || id.size() != strlen(id.c_str())) return false;
+      // Before opened there is no local id to compare: the service can reject
+      // authentication/upstream setup with a newly assigned id in its error.
+      if (sessionId_.length() && (id.size() != sessionId_.length() ||
+          memcmp(id.c_str(), sessionId_.c_str(), id.size()) != 0)) return false;
+    }
+    return true;
   }
 
   void parseJson(uint8_t* bytes, size_t length) {
@@ -408,11 +517,20 @@ class VoicebotClient : private WebSocketsClient {
   }
 
   void parseServerJson(const JsonDocument& doc) {
-    const char* type = doc["type"] | "";
-    if (strcmp(type, "opened") == 0) {
+    const JsonVariantConst type = doc["type"];
+    const JsonString encodedType = type.as<JsonString>();
+    if (!encodedType.c_str() || !encodedType.size() || encodedType.size() != strlen(encodedType.c_str())) {
+      failConnection("Invalid message type", true, FailureReason::Protocol);
+      return;
+    }
+    if (closeRequested_ && type != "closed" && type != "disconnect") return;
+    if (opened_ && !matchesSessionEnvelope(doc)) {
+      Serial.println("[Voicebot] Ignored an envelope for another version or session.");
+      return;
+    }
+    if (type == "opened") {
       const char* id = doc["id"] | "";
-      const char* version = doc["version"] | "";
-      if (!awaitingOpened_ || opened_ || strcmp(version, "2") || !validSessionId(id)) {
+      if (!awaitingOpened_ || opened_ || doc["version"] != "2" || !validSessionId(doc["id"])) {
         failConnection("Invalid opened session", true);
         return;
       }
@@ -429,48 +547,72 @@ class VoicebotClient : private WebSocketsClient {
       JsonObjectConst entry = media.size() == 1 ? media[0].as<JsonObjectConst>() : JsonObjectConst();
       JsonArrayConst channels = entry["channels"].as<JsonArrayConst>();
       const bool supportedAudio = !entry.isNull() &&
-          strcmp(entry["type"] | "", "audio/L16") == 0 &&
+          entry["type"] == "audio/L16" &&
           (entry["sampleRateHz"] | 0) == 16000 && channels.size() == 1 &&
-          strcmp(channels[0] | "", "external") == 0;
+          channels[0] == "external";
       if (!supportedAudio || !startPaused.is<bool>() || startPaused.as<bool>()) {
         failConnection("Unsupported session audio format", true);
         return;
       }
       sessionId_ = id;
       if (sessionId_.length() != strlen(id)) {
-        failConnection("Could not allocate session identifier", true);
+        failConnection("Could not allocate session identifier", true, FailureReason::Resource);
         return;
       }
       seq_ = clientseq.as<uint32_t>();
       opened_ = true;
       awaitingOpened_ = false;
       lastPing_ = millis();
+      lastInboundAt_ = lastPing_;
+      observedReceiveProgress_ = receiveProgress();
       Serial.println("[Voicebot] Session opened: PCM16 mono at 16 kHz.");
       if (onOpened_) onOpened_(sessionId_);
       return;
     }
 
-    if (strcmp(type, "closed") == 0) {
+    if (!matchesSessionEnvelope(doc)) {
+      Serial.println("[Voicebot] Ignored an envelope for another version or session.");
+      return;
+    }
+    if (type == "closed") {
       if (closeRequested_) stop();
-      else failConnection("Server closed the session", true);
+      else failConnection("Server completed the session", true, FailureReason::ServerCompleted);
       return;
     }
-    if (strcmp(type, "disconnect") == 0) {
-      failConnection("Server ended the session", true);
+    if (type == "disconnect") {
+      if (closeRequested_) { stop(); return; }
+      const JsonVariantConst reason = doc["parameters"]["reason"];
+      if (reason == "completed") {
+        failConnection("Server completed the session", true, FailureReason::ServerCompleted);
+      } else if (reason == "unauthorized") {
+        failConnection("Server rejected session authorization", true, FailureReason::Unauthorized);
+      } else if (reason == "error") {
+        failConnection("Server reported an error", true, FailureReason::ServerError);
+      } else {
+        // Do not echo arbitrary server info: it may contain credentials or URLs.
+        failConnection("Server ended the session with an unknown reason", true, FailureReason::Protocol);
+      }
       return;
     }
-    if (opened_ && strcmp(type, "barge_in") == 0) {
+    if (type == "pong") {
+      const JsonVariantConst ack = doc["clientseq"];
+      if (ack.isUnbound() || (ack.is<uint32_t>() && ack.as<uint32_t>() == pendingPingSeq_)) {
+        pingOutstanding_ = false;
+      }
+      return;
+    }
+    if (opened_ && type == "barge_in") {
       if (onBargeIn_) onBargeIn_();
       return;
     }
-    if (!opened_ || strcmp(type, "event")) return;
+    if (!opened_ || type != "event") return;
 
     JsonArrayConst entities = doc["parameters"]["entities"].as<JsonArrayConst>();
     size_t logBudget = kLogBudgetPerMessage;
     for (JsonObjectConst entity : entities) {
-      const char* eventType = entity["type"] | "";
+      const JsonVariantConst eventType = entity["type"];
       JsonObjectConst data = entity["data"];
-      if (strcmp(eventType, "user_turn_response") == 0) {
+      if (eventType == "user_turn_response") {
         const char* transcript = data["transcript"]["result"]["text"] | "";
         const bool isFinal = data["is_final"] | false;
         const size_t logLimit = logBudget < kMaxLogTextBytes ? logBudget : kMaxLogTextBytes;
@@ -483,7 +625,7 @@ class VoicebotClient : private WebSocketsClient {
         if (onUserStt_ && *transcript) {
           onUserStt_(String(transcript, textPrefixLength(transcript, kMaxDisplayTextBytes)), isFinal);
         }
-      } else if (strcmp(eventType, "bot_turn_response") == 0) {
+      } else if (eventType == "bot_turn_response") {
         const char* output = data["output"] | "";
         const size_t logLimit = logBudget < kMaxLogTextBytes ? logBudget : kMaxLogTextBytes;
         const size_t logLength = textPrefixLength(output, logLimit);
@@ -494,7 +636,7 @@ class VoicebotClient : private WebSocketsClient {
         if (onBotReply_ && *output) {
           onBotReply_(String(output, textPrefixLength(output, kMaxDisplayTextBytes)));
         }
-      } else if (strcmp(eventType, "barge_in") == 0) {
+      } else if (eventType == "barge_in") {
         if (onBargeIn_) onBargeIn_();
       }
     }

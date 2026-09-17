@@ -23,10 +23,16 @@ class WebSocketsClient {
   void onEvent(Event callback) { event = std::move(callback); }
   void setBinaryReceiveCapacity(std::function<size_t()> callback) { capacity = std::move(callback); }
   bool isReceivingBinary() const { return receivingBinary; }
+  bool isReceiveBackpressured() const { return receiveBackpressured; }
+  uint32_t receiveProgress() const { return receiveCount; }
+  uint16_t lastCloseCode() const { return closeCode; }
   void beginSslWithCA(const char*, uint16_t, const char* path, const char* ca, const char*) {
     beginCount++;
     url = path;
     certificate = ca;
+    closeCode = 0;
+    receiveCount = 0;
+    receiveBackpressured = false;
   }
   void setExtraHeaders(const char* headers) { extraHeaders = headers ? headers : ""; }
   void setReconnectInterval(unsigned long interval) { (void)interval; }
@@ -55,12 +61,18 @@ class WebSocketsClient {
     std::vector<uint8_t> bytes(data.begin(), data.end());
     if (type == WStype_CONNECTED) connected = true;
     if (type == WStype_DISCONNECTED) connected = false;
+    if (type == WStype_TEXT || type == WStype_BIN || type == WStype_PING || type == WStype_PONG) {
+      receiveCount += static_cast<uint32_t>(bytes.size() + 2);
+    }
     event(type, bytes.empty() ? nullptr : bytes.data(), bytes.size());
   }
   Event event;
   std::function<size_t()> capacity;
   bool connected = false;
   bool receivingBinary = false;
+  bool receiveBackpressured = false;
+  uint32_t receiveCount = 0;
+  uint16_t closeCode = 0;
   bool sendSucceeds = true;
   bool writable = true;
   unsigned beginCount = 0, loopCount = 0, disconnectCount = 0;
@@ -316,6 +328,7 @@ static void testUnsupportedOpenedRejected() {
   const std::vector<std::pair<std::string, std::string>> changes = {
     {"16000", "24000"}, {"session-001", ""},
     {"session-001", std::string(129, 's')}, {"session-001", "bad\\\"id"},
+    {"session-001", "session-001\\u0000hidden"},
     {"\"2\"", "\"3\""}, {"\"startPaused\":false", "\"startPaused\":true"}
   };
   for (const auto& change : changes) {
@@ -326,6 +339,7 @@ static void testUnsupportedOpenedRejected() {
     invalid.replace(invalid.find(change.first), change.first.size(), change.second);
     ws().emit(WStype_TEXT, invalid);
     assert(!client.isRunning() && !client.isOpened() && !ws().connected);
+    assert(client.failureReason() == VoicebotClient::FailureReason::Protocol && !client.retryableDisconnect());
   }
 
   std::vector<std::string> invalids;
@@ -389,6 +403,30 @@ static void testBoundedJsonAndArenaReuse() {
   assert(client.isOpened() && reply.size() == 2048);
   assert(Serial.log.size() <= 280);
 
+  for (size_t textBytes : {size_t(4096), size_t(7000)}) {
+    std::string large = R"({"version":"2","id":"session-001","type":"event","parameters":{"entities":[{"type":"bot_turn_response","data":{"output":")";
+    large += std::string(textBytes, 'L');
+    large += "\"}}]}}";
+    assert(large.size() < 8192);
+    const unsigned before = replies;
+    Serial.log.clear();
+    ws().emit(WStype_TEXT, large);
+    assert(client.isOpened() && replies == before + 1 && reply == std::string(2048, 'L'));
+    assert(Serial.log.size() <= 280);
+  }
+
+  {
+    std::string metadata = R"({"version":"2","seq":19,"clientseq":4,"id":"session-001","type":"event","parameters":{"entities":[{"type":"bot_turn_response","data":{"output":")";
+    metadata += std::string(6500, 'M');
+    metadata += R"(","action":"None","response_type":"text","phone_transfer":null,"future_metadata":{"provider_details":")";
+    metadata += std::string(700, 'd');
+    metadata += "\"}}}]}}";
+    assert(metadata.size() < 8192);
+    const unsigned before = replies;
+    ws().emit(WStype_TEXT, metadata);
+    assert(client.isOpened() && replies == before + 1 && reply == std::string(2048, 'M'));
+  }
+
   const std::string thai = "ส";
   std::string unicodeReply = R"({"type":"event","parameters":{"entities":[{"type":"bot_turn_response","data":{"output":")";
   for (unsigned i = 0; i < 800; ++i) unicodeReply += thai;
@@ -428,6 +466,233 @@ static void testBoundedJsonAndArenaReuse() {
   }
 }
 
+
+static void testEnvelopeValidationAndLegacyCompatibility() {
+  VoicebotClient client;
+  unsigned barges = 0, replies = 0, disconnects = 0;
+  client.setBargeInCallback([&] { ++barges; });
+  client.setBotReplyCallback([&](const String&) { ++replies; });
+  client.setDisconnectCallback([&](const String&) { ++disconnects; });
+  connect(client);
+  for (const std::string& prefix : {
+      std::string(R"("version":"3",)"), std::string(R"("version":null,)"),
+      std::string(R"("version":"2\u0000bad",)"), std::string(R"("id":"other-session",)"),
+      std::string(R"("id":123,)"), std::string(R"("id":null,)"),
+      std::string(R"("id":"session-001\u0000hidden",)")}) {
+    for (const std::string& type : {"barge_in", "closed", "disconnect", "opened"}) {
+      ws().emit(WStype_TEXT, "{" + prefix + "\"type\":\"" + type + "\"}");
+      assert(client.isOpened() && barges == 0 && disconnects == 0);
+    }
+  }
+  ws().emit(WStype_TEXT, R"({"type":"barge_in","future_field":{"anything":true}})");
+  assert(barges == 1 && client.isOpened());
+  ws().emit(WStype_TEXT, event);  // Legacy envelope with no id remains accepted.
+  assert(barges == 2 && replies == 1 && client.isOpened());
+  ws().emit(WStype_TEXT, R"({"version":"2","id":"session-001","type":"barge_in"})");
+  assert(barges == 3 && client.isOpened());
+}
+
+static void testFailureClassificationAndSafeDiagnostics() {
+  using Reason = VoicebotClient::FailureReason;
+  for (const auto& expected : std::vector<std::pair<std::string, Reason>>{
+      {"completed", Reason::ServerCompleted}, {"unauthorized", Reason::Unauthorized},
+      {"error", Reason::ServerError}, {"unknown", Reason::Protocol}}) {
+    VoicebotClient client;
+    unsigned notifications = 0;
+    client.setDisconnectCallback([&](const String& message) {
+      ++notifications;
+      assert(client.failureReason() == expected.second);
+      assert(client.retryableDisconnect() == (expected.second == Reason::ServerError));
+      assert(std::string(message.c_str()).find("private-secret") == std::string::npos);
+    });
+    connect(client);
+    Serial.log.clear();
+    ws().emit(WStype_TEXT, "{\"type\":\"disconnect\",\"parameters\":{\"reason\":\"" + expected.first +
+        "\",\"info\":\"https://example.test/?api_key=private-secret\"}}");
+    assert(!client.isRunning() && notifications == 1);
+    assert(Serial.log.find("private-secret") == std::string::npos);
+    client.stop();
+    assert(client.failureReason() == expected.second);  // Owner may stop before inspecting.
+  }
+  for (const auto& expected : std::vector<std::pair<std::string, Reason>>{
+      {"unauthorized", Reason::Unauthorized}, {"error", Reason::ServerError}}) {
+    VoicebotClient client;
+    unsigned notifications = 0;
+    client.setDisconnectCallback([&](const String&) {
+      ++notifications;
+      assert(client.failureReason() == expected.second);
+    });
+    start(client);
+    ws().emit(WStype_CONNECTED);
+    for (const std::string& invalidEnvelope : {
+        std::string(R"("version":"3","id":"not-yet-open",)"),
+        std::string(R"("version":"2","id":123,)"),
+        std::string(R"("version":"2","id":"not-yet-open\u0000bad",)")}) {
+      ws().emit(WStype_TEXT, "{" + invalidEnvelope +
+          "\"type\":\"disconnect\",\"parameters\":{\"reason\":\"" + expected.first + "\"}}");
+      assert(client.isRunning() && notifications == 0);
+    }
+    ws().emit(WStype_TEXT, "{\"version\":\"2\",\"id\":\"not-yet-open\",\"type\":\"disconnect\",\"parameters\":{\"reason\":\"" +
+        expected.first + "\"}}");
+    assert(!client.isRunning() && notifications == 1);
+    assert(client.retryableDisconnect() == (expected.second == Reason::ServerError));
+  }
+  for (const auto& expected : std::vector<std::pair<uint16_t, Reason>>{
+      {0, Reason::Network}, {1000, Reason::ServerCompleted}, {1008, Reason::Unauthorized},
+      {1011, Reason::ServerError}, {1002, Reason::Protocol}, {1009, Reason::Protocol}}) {
+    VoicebotClient client;
+    connect(client);
+    ws().closeCode = expected.first;
+    ws().emit(WStype_DISCONNECTED);
+    assert(client.failureReason() == expected.second && !client.isRunning());
+    const bool retry = expected.second == Reason::Network || expected.second == Reason::ServerError;
+    assert(client.retryableDisconnect() == retry);
+  }
+  {
+    VoicebotClient client;
+    start(client);
+    ws().emit(WStype_CONNECTED);
+    ws().closeCode = 1008;  // Authentication can fail before opened.
+    ws().emit(WStype_DISCONNECTED);
+    assert(client.failureReason() == Reason::Unauthorized && !client.retryableDisconnect());
+  }
+  {
+    VoicebotClient client;
+    connect(client);
+    ws().emit(WStype_TEXT, "{");
+    assert(client.failureReason() == Reason::Protocol && !client.retryableDisconnect());
+  }
+}
+
+static void testTrafficAwareLiveness() {
+  using Reason = VoicebotClient::FailureReason;
+  {
+    VoicebotClient client;
+    fakeMillis = 1000;
+    connect(client);
+    fakeMillis = 21000;
+    client.loop();  // Outstanding application ping, but no inbound responses.
+    fakeMillis = 60999;
+    client.loop();
+    assert(client.isOpened());
+    fakeMillis = 61000;
+    client.loop();
+    assert(!client.isRunning() && client.failureReason() == Reason::Timeout && client.retryableDisconnect());
+  }
+  {
+    VoicebotClient client;
+    fakeMillis = 0;
+    connect(client);
+    ws().writable = false;
+    client.loop();
+    fakeMillis = 59999;
+    client.loop();
+    assert(client.isOpened());
+    fakeMillis = 60000;
+    client.loop();
+    assert(!client.isRunning() && client.retryableDisconnect());
+    assert(ws().messages.empty());
+  }
+  for (bool partialReads : {false, true}) {
+    VoicebotClient client;
+    fakeMillis = 0;
+    connect(client);
+    for (uint32_t now = 10000; now <= 180000; now += 10000) {
+      fakeMillis = now;
+      if (partialReads) ++ws().receiveCount;  // Partial TCP headers/payloads count.
+      else ws().emit(WStype_BIN, std::string(640, 'a'));
+      client.loop();
+      assert(client.isOpened());  // Missing pong alone cannot kill active audio.
+    }
+  }
+  {
+    VoicebotClient client;
+    fakeMillis = 0;
+    connect(client);
+    fakeMillis = 20000;
+    client.loop();
+    ws().receiveBackpressured = true;
+    fakeMillis = 120000;
+    client.loop();
+    fakeMillis = 240000;
+    client.loop();
+    assert(client.isOpened());
+    ws().receiveBackpressured = false;
+    fakeMillis = 300000;
+    client.loop();
+    assert(client.isOpened());
+    fakeMillis = 359999;
+    client.loop();
+    assert(client.isOpened());
+    fakeMillis = 360000;
+    client.loop();
+    assert(!client.isRunning() && client.failureReason() == Reason::Timeout);
+  }
+  {
+    VoicebotClient client;
+    fakeMillis = 0;
+    connect(client);
+    fakeMillis = 59000;
+    client.loop();  // First delayed ping still deserves a response grace period.
+    fakeMillis = 60000;
+    client.loop();
+    assert(client.isOpened());
+    fakeMillis = 69000;
+    client.loop();
+    assert(!client.isRunning());
+  }
+  for (bool correctAck : {false, true}) {
+    VoicebotClient client;
+    fakeMillis = 0;
+    connect(client);
+    fakeMillis = 20000;
+    client.loop();
+    fakeMillis = 25000;
+    ws().emit(WStype_TEXT, correctAck ? R"({"type":"pong","clientseq":2})"
+                                      : R"({"type":"pong","clientseq":999})");
+    client.loop();
+    fakeMillis = 85000;
+    client.loop();
+    assert(client.isOpened() == correctAck);
+  }
+  {
+    VoicebotClient client;
+    const uint32_t base = UINT32_MAX - 30000;
+    fakeMillis = base;
+    connect(client);
+    fakeMillis = base + 20000;
+    client.loop();
+    fakeMillis = base + 59999;
+    client.loop();
+    assert(client.isOpened());
+    fakeMillis = base + 60000;
+    client.loop();
+    assert(!client.isRunning() && client.retryableDisconnect());
+  }
+}
+
+static void testClosingSuppressesAllDataCallbacks() {
+  VoicebotClient client;
+  unsigned callbacks = 0;
+  client.setTtsAudioCallback([&](const uint8_t*, size_t) { ++callbacks; });
+  client.setOpenedCallback([&](const String&) { ++callbacks; });
+  client.setUserSttCallback([&](const String&, bool) { ++callbacks; });
+  client.setBotReplyCallback([&](const String&) { ++callbacks; });
+  client.setBargeInCallback([&] { ++callbacks; });
+  client.setDisconnectCallback([&](const String&) { ++callbacks; });
+  connect(client);
+  const unsigned openedCallbacks = callbacks;
+  client.requestClose();
+  ws().emit(WStype_TEXT, event);
+  ws().emit(WStype_TEXT, R"({"type":"barge_in"})");
+  ws().emit(WStype_TEXT, opened);
+  ws().emit(WStype_BIN, std::string(640, 'x'));
+  assert(callbacks == openedCallbacks && client.isClosing());
+  client.loop();
+  ws().emit(WStype_TEXT, R"({"version":"2","id":"session-001","type":"closed"})");
+  assert(callbacks == openedCallbacks && !client.isRunning());
+}
+
 int main() {
   testVerifiedTlsAndCredentialRedaction();
   testSessionAndOutboundPackets();
@@ -439,5 +704,11 @@ int main() {
   testUnsupportedOpenedRejected();
   testSendFailureClosesSession();
   testBoundedJsonAndArenaReuse();
+  testEnvelopeValidationAndLegacyCompatibility();
+  testFailureClassificationAndSafeDiagnostics();
+  testTrafficAwareLiveness();
+  testClosingSuppressesAllDataCallbacks();
+  static_assert(sizeof(VoicebotClient) < 14 * 1024, "Client host footprint exceeded its bounded budget");
+  std::cout << "Voicebot client host object size: " << sizeof(VoicebotClient) << " bytes (fixed JSON arena: 12288)\n";
   std::cout << "Voicebot client: TLS, lifecycle, pacing inputs, bounded JSON, and 2000-message reuse passed\n";
 }

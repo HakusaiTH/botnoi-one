@@ -68,6 +68,9 @@ extern "C" {
  */
 void WebSockets::clientDisconnect(WSclient_t * client, uint16_t code, char * reason, size_t reasonLen) {
     DEBUG_WEBSOCKETS("[WS][%d][handleWebsocket] clientDisconnect code: %u\n", client->num, code);
+    // Preserve peer/protocol failure classification through cleanup. A local
+    // normal close must not replace the reason already observed from the peer.
+    if(code && code != 1000) client->lastCloseCode = code;
     if(client->status == WSC_CONNECTED && code) {
         if(reason) {
             sendFrame(client, WSop_close, (uint8_t *)reason, reasonLen);
@@ -221,6 +224,9 @@ void WebSockets::headerDone(WSclient_t * client) {
     client->status = WSC_CONNECTED;
     client->rx.reset();
     client->rxBackpressured = false;
+    client->rxProgress = 0;
+    client->lastCloseCode = 0;
+    client->pendingPong.reset();
     client->httpLine = "";
     client->httpHeaderBytes = 0;
 }
@@ -233,7 +239,8 @@ void WebSockets::handleWebsocket(WSclient_t * client) {
     client->rxBackpressured = client->rx.isReceivingBinary() && capacity == 0;
     const uint32_t now = millis();
     if(client->rx.timedOut(now, client->rxBackpressured)) {
-        clientDisconnect(client, 1002);
+        // Missing input is a transport stall, not proof of malformed framing.
+        clientDisconnect(client);
         return;
     }
     const size_t wanted = client->rx.nextReadSize(capacity);
@@ -243,6 +250,7 @@ void WebSockets::handleWebsocket(WSclient_t * client) {
     const size_t count = std::min(wanted, static_cast<size_t>(available));
     const int read = client->tcp->read(chunk, count);
     if(read <= 0) return;
+    ++client->rxProgress;
     WebSocketsStream::Event event;
     const uint16_t error = client->rx.consume(chunk, static_cast<size_t>(read), now, event);
     if(error) {
@@ -251,10 +259,15 @@ void WebSockets::handleWebsocket(WSclient_t * client) {
     }
     // No parser/TCP access after user callbacks: callbacks may disconnect.
     if(event.opcode == WSop_ping) {
-        if(!sendFrame(client, WSop_pong, event.data, event.length)) return;
+        if(!client->pendingPong.queue(event.data, event.length)) {
+            clientDisconnect(client, 1002);
+            return;
+        }
     } else if(event.opcode == WSop_pong) {
         client->pongReceived = true;
     } else if(event.opcode == WSop_close) {
+        client->lastCloseCode = event.length >= 2
+            ? (uint16_t(event.data[0]) << 8) | event.data[1] : 1005;
         sendFrame(client, WSop_close, event.data, event.length);
         clientDisconnect(client);
         return;

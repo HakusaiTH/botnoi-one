@@ -46,6 +46,7 @@
 
 #include "WebSocketsVersion.h"
 #include "WebSocketsStream.h"
+#include "WebSocketsControl.h"
 
 #ifndef NODEBUG_WEBSOCKETS
 #ifdef DEBUG_ESP_PORT
@@ -414,6 +415,9 @@ typedef struct {
 
     WebSocketsStream rx;
     bool rxBackpressured = false;
+    uint32_t rxProgress = 0;
+    uint16_t lastCloseCode = 0;
+    WebSocketsPendingPong pendingPong;
     String httpLine;
     size_t httpHeaderBytes = 0;
 

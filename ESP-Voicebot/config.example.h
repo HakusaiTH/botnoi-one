@@ -37,9 +37,9 @@
 #endif
 
 // The session itself is hands-free and remains open across turns either way.
-// Default: pause mic upload only while the bot replies, avoiding loudspeaker
-// echo and duplex congestion. Set to 1 only with acoustic isolation or echo
-// cancellation when Talking-Jelly-style barge-in is required and tested.
+// Default: send silence while the bot replies, avoiding loudspeaker echo while
+// preserving continuous PCM cadence. Set to 1 with acoustic isolation or echo
+// cancellation when barge-in is required and tested.
 #ifndef VOICEBOT_FULL_DUPLEX
 #define VOICEBOT_FULL_DUPLEX 0
 #endif

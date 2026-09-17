@@ -54,6 +54,9 @@ void WebSocketsClient::begin(const char * host, uint16_t port, const char * url,
     if(_client.tcp) clientDisconnect(&_client, "Restarting connection");
     _client.rx.reset();
     _client.rxBackpressured = false;
+    _client.rxProgress = 0;
+    _client.lastCloseCode = 0;
+    _client.pendingPong.reset();
     _client.httpLine = "";
     _client.httpHeaderBytes = 0;
     _host = host;
@@ -261,6 +264,8 @@ void WebSocketsClient::loop(void) {
         if((millis() - _lastConnectionFail) < _reconnectInterval) {
             return;
         }
+        _client.lastCloseCode = 0;
+        _client.rxProgress = 0;
 
 #if defined(HAS_SSL)
         if(_client.isSSL) {
@@ -367,11 +372,14 @@ void WebSocketsClient::loop(void) {
         handleClientData();
         WEBSOCKETS_YIELD();
         if(_client.status == WSC_CONNECTED) {
+            // A queued pong takes precedence over application sends. Reading
+            // first lets a newer ping replace one deferred by TCP congestion.
+            if(!flushPendingPong()) return;
             if(_client.rxBackpressured) {
                 // A pong may be queued behind the audio we intentionally paused.
                 _client.lastPing = millis();
             } else {
-                handleHBPing();
+                if(canSendNow()) handleHBPing();
                 handleHBTimeout(&_client);
             }
         }
@@ -524,12 +532,25 @@ bool WebSocketsClient::isConnected(void) {
 }
 
 bool WebSocketsClient::canSendNow() const {
-    if(_client.status != WSC_CONNECTED || !_client.tcp) return false;
+    if(_client.status != WSC_CONNECTED || !_client.tcp || _client.pendingPong.pending()) return false;
 #if defined(ESP32)
     return webSocketsSocketWritable(_client.tcp->fd());
 #else
     return _client.tcp->connected();
 #endif
+}
+
+bool WebSocketsClient::flushPendingPong() {
+    if(!_client.pendingPong.pending()) return true;
+    if(_client.status != WSC_CONNECTED || !_client.tcp) return false;
+#if defined(ESP32)
+    const bool writable = webSocketsSocketWritable(_client.tcp->fd());
+#else
+    const bool writable = _client.tcp->connected();
+#endif
+    return _client.pendingPong.flush(writable, [this](uint8_t * payload, size_t length) {
+        return sendFrame(&_client, WSop_pong, payload, length);
+    });
 }
 
 /**
@@ -627,6 +648,7 @@ void WebSocketsClient::clientDisconnect(WSclient_t * client, const char * reason
     client->cSessionId   = "";
     client->rx.reset();
     client->rxBackpressured = false;
+    client->pendingPong.reset();
     client->httpLine = "";
     client->httpHeaderBytes = 0;
 

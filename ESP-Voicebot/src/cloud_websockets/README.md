@@ -6,7 +6,8 @@ were normalized to LF.
 
 This copy is specialized for the synchronous ESP32 voicebot client.
 `voicebot.patch` records all differences from those four upstream client files
-and adds `WebSocketsStream.h` and `WebSocketsWritable.h`. It replaces the old `byteplus.patch` and uses
+and adds `WebSocketsStream.h`, `WebSocketsWritable.h`, and `WebSocketsControl.h`.
+It replaces the old `byteplus.patch` and uses
 zero-context diffs so the patch artifact has no trailing whitespace. Apply it
 to LF-normalized upstream sources with `git apply --unidiff-zero voicebot.patch`.
 
@@ -25,6 +26,18 @@ to LF-normalized upstream sources with `git apply --unidiff-zero voicebot.patch`
   message. False means continue receiving and try on a later loop. Socket
   readiness avoids ordinary TCP congestion waits but cannot guarantee that TLS
   finishes a write immediately; failed/partial writes still close the session.
+- RFC ping replies retain at most one 125-byte payload while TCP is congested;
+  newer pings replace the pending payload. Each `loop()` makes at most one pong
+  write attempt, only when writable, before application sends. `canSendNow()`
+  remains false until the pending pong has flushed. Disconnect clears it.
+- `receiveProgress()` is a wrapping counter incremented on every positive
+  WebSocket TCP read, including partial headers and payloads. It resets at a new
+  connection. `isReceiveBackpressured()` reports intentional audio-capacity
+  stalls so application keepalive deadlines can exclude them.
+- `lastCloseCode()` retains peer status or a decoder protocol-error code through
+  disconnect cleanup, until the next connection attempt. Zero means no close
+  code was observed; 1005 represents a peer close with no status. Incomplete-input
+  inactivity closes TCP as a transport stall, without claiming malformed framing.
 - The receiver owns an 8,193-byte text buffer, a 125-byte control buffer, and
   small parser state. Receive uses 640 bytes of stack scratch; transmit uses
   654 bytes. No frame-sized allocation or PSRAM fallback occurs.

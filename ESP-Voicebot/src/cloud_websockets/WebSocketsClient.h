@@ -121,6 +121,10 @@ class WebSocketsClient : protected WebSockets {
     // ESP32: zero-timeout TCP writability check, with no receive or reconnect
     // side effects. False means defer sending and keep pumping loop().
     bool canSendNow() const;
+    // Receive progress includes partial headers/payloads, not just events.
+    bool isReceiveBackpressured() const { return _client.rxBackpressured; }
+    uint32_t receiveProgress() const { return _client.rxProgress; }
+    uint16_t lastCloseCode() const { return _client.lastCloseCode; }
     String getUrl(void);
 
   protected:
@@ -187,6 +191,7 @@ class WebSocketsClient : protected WebSockets {
     void connectFailedCb();
 
     void handleHBPing();    // send ping in specified intervals
+    bool flushPendingPong();
 
 #if (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP8266_ASYNC)
     void asyncConnect();
