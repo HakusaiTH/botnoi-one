@@ -44,23 +44,5 @@ int main() {
     return true;
   }));
   assert(!assembler.append(bytes, 2, 3, [](const AudioFrame&) { return false; }));
-  SilenceTail tail;
-  assert(!tail.active() && !tail.due(0));
-  uint32_t now = UINT32_MAX - 40;
-  tail.start(now);
-  for (size_t i = 0; i < 25; ++i) {
-    assert(tail.active() && tail.due(now));
-    tail.sent(now);
-    assert(!tail.due(now));
-    assert(!tail.due(now + 19));
-    now += 20;
-  }
-  assert(!tail.active() && !tail.due(now));
-  tail.start(10);
-  assert(tail.due(1000));
-  tail.sent(1000);
-  assert(!tail.due(1000) && !tail.due(1019) && tail.due(1020));
-  tail.reset();
-  assert(!tail.active());
-  std::puts("Audio pipeline: long PCM, odd boundaries, queue capacity, cancel and paced silence passed");
+  std::puts("Audio pipeline: long PCM, odd boundaries, queue capacity and cancellation passed");
 }

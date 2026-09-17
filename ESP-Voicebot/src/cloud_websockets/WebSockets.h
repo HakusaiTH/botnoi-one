@@ -129,6 +129,9 @@
 #ifndef WEBSOCKETS_TCP_TIMEOUT
 #define WEBSOCKETS_TCP_TIMEOUT (3000)
 #endif
+#ifndef WEBSOCKETS_IO_TIMEOUT
+#define WEBSOCKETS_IO_TIMEOUT (250)
+#endif
 
 #define NETWORK_ESP8266_ASYNC (0)
 #define NETWORK_ESP8266 (1)
@@ -242,7 +245,17 @@
 #include <WiFiClientSecure.h>
 #define SSL_AXTLS
 #define WEBSOCKETS_NETWORK_CLASS WiFiClient
-#define WEBSOCKETS_NETWORK_SSL_CLASS WiFiClientSecure
+// Arduino-ESP32's public setTimeout() updates socket options but not the
+// mbedTLS progress deadline captured during connect. This specialized client
+// updates both after the HTTP upgrade, bounding a stalled voice/control write.
+class VoicebotWiFiClientSecure : public WiFiClientSecure {
+  public:
+    void setVoicebotIoTimeout(unsigned long timeout) {
+        setTimeout(timeout);
+        if(sslclient) sslclient->socket_timeout = timeout;
+    }
+};
+#define WEBSOCKETS_NETWORK_SSL_CLASS VoicebotWiFiClientSecure
 #define WEBSOCKETS_NETWORK_SERVER_CLASS WiFiServer
 
 #elif (WEBSOCKETS_NETWORK_TYPE == NETWORK_ESP32_ETH)

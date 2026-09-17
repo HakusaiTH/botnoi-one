@@ -324,6 +324,9 @@ size_t WebSockets::write(WSclient_t * client, uint8_t * out, size_t n) {
     if(client == NULL)
         return 0;
     unsigned long t = millis();
+    const unsigned long timeout = client->status == WSC_CONNECTED
+                                      ? WEBSOCKETS_IO_TIMEOUT
+                                      : WEBSOCKETS_TCP_TIMEOUT;
     size_t len      = 0;
     size_t total    = 0;
     DEBUG_WEBSOCKETS("[write] n: %zu t: %lu\n", n, t);
@@ -338,7 +341,7 @@ size_t WebSockets::write(WSclient_t * client, uint8_t * out, size_t n) {
             break;
         }
 
-        if((millis() - t) > WEBSOCKETS_TCP_TIMEOUT) {
+        if((millis() - t) >= timeout) {
             DEBUG_WEBSOCKETS("[write] write TIMEOUT! %lu\n", (millis() - t));
             break;
         }

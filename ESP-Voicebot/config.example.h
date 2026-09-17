@@ -36,9 +36,10 @@
 #define VOICEBOT_BUTTON_PIN 46
 #endif
 
-// Default: keep recording intent, but pause mic upload while the bot replies.
-// This avoids speaker echo and simultaneous upload/download congestion on S3s
-// without PSRAM. Set to 1 only when full duplex/barge-in is required and tested.
+// The session itself is hands-free and remains open across turns either way.
+// Default: pause mic upload only while the bot replies, avoiding loudspeaker
+// echo and duplex congestion. Set to 1 only with acoustic isolation or echo
+// cancellation when Talking-Jelly-style barge-in is required and tested.
 #ifndef VOICEBOT_FULL_DUPLEX
 #define VOICEBOT_FULL_DUPLEX 0
 #endif

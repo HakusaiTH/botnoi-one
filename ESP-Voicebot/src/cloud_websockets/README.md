@@ -37,9 +37,12 @@ to LF-normalized upstream sources with `git apply --unidiff-zero voicebot.patch`
   immediately expire the next frame. Buffered bytes are drained before EOF,
   then all receive state and network objects are reset on disconnect.
 - HTTP response parsing is incremental, with a 1 KiB line cap and 8 KiB total
-  cap. TCP connection/write timeouts are 3 seconds; ESP32 TLS handshake timeout
-  is 8 **seconds**, matching the ESP32 API's units. HTTP upgrade has a separate
-  3-second deadline. Library logging remains disabled to protect credentials.
+  cap. TCP connection and HTTP upgrade deadlines are 3 seconds; the ESP32 TLS
+  handshake timeout is 8 **seconds**, matching the ESP32 API's units. After a
+  successful upgrade, both the mbedTLS/socket progress deadline and the complete
+  WebSocket write retry loop are reduced to 250 ms so congested audio/control
+  writes cannot monopolize `loop()` for seconds. Library logging remains disabled
+  to protect credentials.
 - Outgoing frames use a fresh ESP32 hardware-random mask and fixed scratch
   storage, including callers with reserved header space. The source PCM is
   unchanged, common 640-byte audio packets use one TLS write, and a partial
@@ -51,7 +54,7 @@ enough space for the following binary event; it must not claim space another
 producer can consume first. A slow consumer applies TCP backpressure, so control
 frames behind an unfinished binary frame must wait for that audio to drain.
 Connection establishment and a stalled outbound write can still block up to
-their configured deadlines.
+their separate configured deadlines.
 
 The framing rules follow [RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455),
 especially sections 5.2, 5.4 and 5.5. The host regression test exercises a 768 KiB

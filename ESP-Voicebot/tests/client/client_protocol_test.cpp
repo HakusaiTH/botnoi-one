@@ -28,8 +28,8 @@ class WebSocketsClient {
     url = path;
     certificate = ca;
   }
-  void setExtraHeaders(const char*) {}
-  void setReconnectInterval(unsigned long interval) { reconnectInterval = interval; }
+  void setExtraHeaders(const char* headers) { extraHeaders = headers ? headers : ""; }
+  void setReconnectInterval(unsigned long interval) { (void)interval; }
   void loop() { loopCount++; }
   bool isConnected() { return connected; }
   bool canSendNow() const { return connected && writable; }
@@ -48,6 +48,7 @@ class WebSocketsClient {
   bool sendTXT(char* text, size_t length) {
     if (!sendSucceeds || !writable) return false;
     messages.emplace_back(text, length);
+    fakeMillis += sendDelayMs;
     return true;
   }
   void emit(WStype_t type, const std::string& data = "") {
@@ -63,8 +64,9 @@ class WebSocketsClient {
   bool sendSucceeds = true;
   bool writable = true;
   unsigned beginCount = 0, loopCount = 0, disconnectCount = 0;
-  unsigned long reconnectInterval = 0;
+  uint32_t sendDelayMs = 0;
   std::string url;
+  std::string extraHeaders = "Origin: file://";
   const char* certificate = nullptr;
   std::vector<std::string> messages;
   std::vector<std::vector<uint8_t>> binary;
@@ -95,10 +97,10 @@ static void testVerifiedTlsAndCredentialRedaction() {
   Serial.log.clear();
   assert(client.start("voice.example.com", 443, "/v1/call?preview=1", "private+key&x=y", "agent/id", ca));
   assert(ws().certificate == ca);
+  assert(ws().extraHeaders.empty());
   assert(ws().url == "/v1/call?preview=1&api_key=private%2Bkey%26x%3Dy&agent_id=agent%2Fid");
   assert(Serial.log.find("private") == std::string::npos);
   assert(Serial.log.find("api_key") == std::string::npos);
-  assert(ws().reconnectInterval == 5000);
   assert(!client.start("voice.example.com\r\nBad", 443, "/", "key", "agent", ca));
   assert(!client.start("voice.example.com", 443, nullptr, "key", "agent", ca));
   assert(!client.start("voice.example.com", 443, "/", "", "agent", ca));
@@ -147,26 +149,50 @@ static void testSessionAndOutboundPackets() {
   assert(client.isReceivingAudio());
 }
 
-static void testFailureClearsAndReconnectResetsSession() {
+static void testMultipleTurnsReuseOneSession() {
+  VoicebotClient client;
+  unsigned finalTranscripts = 0, replies = 0;
+  client.setUserSttCallback([&](const String&, bool isFinal) {
+    if (isFinal) ++finalTranscripts;
+  });
+  client.setBotReplyCallback([&](const String&) { ++replies; });
+  connect(client);
+  const unsigned beginCount = ws().beginCount;
+  const unsigned disconnectCount = ws().disconnectCount;
+  assert(beginCount == 1);
+  uint8_t pcm[640] = {};
+  for (unsigned turn = 0; turn < 3; ++turn) {
+    assert(client.sendAudioFrame(pcm, sizeof(pcm)));
+    ws().emit(WStype_TEXT, event);
+    ws().emit(WStype_BIN, std::string(640, 't'));
+    assert(client.sendPlaybackStarted());
+    assert(client.sendPlaybackCompleted());
+    assert(client.isOpened());
+    assert(std::string(client.getSessionId().c_str()) == "session-001");
+    assert(ws().beginCount == beginCount && ws().disconnectCount == disconnectCount);
+  }
+  assert(finalTranscripts == 3 && replies == 3);
+}
+
+static void testFailureEndsCallAndExplicitRestartResetsSession() {
   VoicebotClient client;
   unsigned disconnects = 0;
   client.setDisconnectCallback([&](const String&) { disconnects++; });
   connect(client);
   ws().emit(WStype_ERROR, "server URL with secret-key");
-  assert(!client.isOpened() && client.getSessionId().length() == 0);
+  assert(!client.isRunning() && !client.isOpened() && client.getSessionId().length() == 0);
   assert(disconnects == 1);
   ws().emit(WStype_DISCONNECTED);
   assert(disconnects == 1);
   assert(!client.sendPlaybackCompleted());
-  ws().emit(WStype_CONNECTED);
-  ws().emit(WStype_TEXT, opened);
+  connect(client);  // A new physical-button action starts a new server session.
   assert(client.isOpened());
   assert(client.sendPing());
   JsonDocument document;
   assert(!deserializeJson(document, ws().messages.back()));
   assert(document["seq"] == 2);
   ws().emit(WStype_TEXT, R"({"type":"disconnect","parameters":{"info":"session ended"}})");
-  assert(!client.isOpened() && !ws().connected && disconnects == 2);
+  assert(!client.isRunning() && !client.isOpened() && !ws().connected && disconnects == 2);
   const unsigned loops = ws().loopCount;
   client.stop();
   client.loop();
@@ -186,8 +212,7 @@ static void testOpenedTimeoutAndMillisRollover() {
   fakeMillis++;
   client.loop();
   assert(disconnects == 1 && !ws().connected && !client.isOpened());
-  ws().emit(WStype_CONNECTED);
-  ws().emit(WStype_TEXT, opened);
+  connect(client);
   fakeMillis += 20000;
   client.loop();
   assert(ws().messages.size() == 1);
@@ -221,6 +246,72 @@ static void testPingDefersWhileTransportIsFull() {
   assert(ws().messages.size() == 1);
 }
 
+static void testGracefulUserClose() {
+  {
+    VoicebotClient client;
+    unsigned disconnects = 0;
+    client.setDisconnectCallback([&](const String&) { disconnects++; });
+    connect(client);
+    client.requestClose();
+    assert(client.isRunning() && client.isClosing());
+    assert(!client.isOpened() && !client.canSendNow());
+    uint8_t pcm[640] = {};
+    assert(!client.sendAudioFrame(pcm, sizeof(pcm)));
+    client.loop();
+    assert(ws().messages.size() == 1);
+    JsonDocument document;
+    assert(!deserializeJson(document, ws().messages.back()));
+    assert(document["type"] == "close");
+    assert(document["seq"] == 2);
+    assert(document["id"] == "session-001");
+    assert(document["parameters"]["reason"] == "end");
+    ws().emit(WStype_TEXT, R"({"version":"2","type":"closed","id":"session-001"})");
+    assert(!client.isRunning() && !client.isClosing() && !ws().connected);
+    assert(disconnects == 0);
+  }
+  {
+    VoicebotClient client;
+    connect(client);
+    const uint32_t closeAt = fakeMillis;
+    client.requestClose();
+    client.loop();
+    fakeMillis = closeAt + 299;
+    client.loop();
+    assert(client.isRunning() && ws().connected);
+    fakeMillis = closeAt + 300;
+    client.loop();
+    assert(!client.isRunning() && !ws().connected);
+  }
+  {
+    VoicebotClient client;
+    connect(client);
+    ws().writable = false;
+    const uint32_t requestedAt = fakeMillis;
+    client.requestClose();
+    fakeMillis = requestedAt + 900;
+    client.loop();
+    assert(client.isRunning() && ws().messages.empty());
+    ws().writable = true;
+    ws().sendDelayMs = 250;
+    client.loop();
+    const uint32_t sentAt = fakeMillis;
+    assert(ws().messages.size() == 1 && client.isRunning());
+    fakeMillis = sentAt + 299;
+    client.loop();
+    assert(client.isRunning());
+    fakeMillis = sentAt + 300;
+    client.loop();
+    assert(!client.isRunning());
+  }
+  {
+    VoicebotClient client;
+    start(client);
+    assert(client.isRunning());
+    client.requestClose();
+    assert(!client.isRunning());
+  }
+}
+
 static void testUnsupportedOpenedRejected() {
   const std::vector<std::pair<std::string, std::string>> changes = {
     {"16000", "24000"}, {"session-001", ""},
@@ -234,7 +325,31 @@ static void testUnsupportedOpenedRejected() {
     std::string invalid = opened;
     invalid.replace(invalid.find(change.first), change.first.size(), change.second);
     ws().emit(WStype_TEXT, invalid);
-    assert(!client.isOpened() && !ws().connected);
+    assert(!client.isRunning() && !client.isOpened() && !ws().connected);
+  }
+
+  std::vector<std::string> invalids;
+  for (const auto& change : std::vector<std::pair<std::string, std::string>>{
+      {"\"clientseq\":1,", ""},
+      {"\"clientseq\":1", "\"clientseq\":\"1\""},
+      {"\"clientseq\":1", "\"clientseq\":4294967295"},
+      {"\"startPaused\":false,", ""},
+      {"\"startPaused\":false", "\"startPaused\":\"false\""},
+      {"\"external\"", "\"internal\""},
+      {"[\"external\"]", "[]"},
+      {"}]}", "},{\"type\":\"audio/L16\",\"sampleRateHz\":16000,\"channels\":[\"external\"]}]}"}}) {
+    std::string invalid = opened;
+    const size_t at = invalid.find(change.first);
+    assert(at != std::string::npos);
+    invalid.replace(at, change.first.size(), change.second);
+    invalids.push_back(std::move(invalid));
+  }
+  for (const std::string& invalid : invalids) {
+    VoicebotClient client;
+    start(client);
+    ws().emit(WStype_CONNECTED);
+    ws().emit(WStype_TEXT, invalid);
+    assert(!client.isRunning() && !client.isOpened() && !ws().connected);
   }
 }
 
@@ -247,7 +362,8 @@ static void testSendFailureClosesSession() {
     ws().sendSucceeds = false;
     uint8_t pcm[640] = {};
     assert(!(binary ? client.sendAudioFrame(pcm, sizeof(pcm)) : client.sendPlaybackStarted()));
-    assert(disconnects == 1 && !client.isOpened() && client.getSessionId().length() == 0);
+    assert(disconnects == 1 && !client.isRunning() && !client.isOpened() &&
+           client.getSessionId().length() == 0);
   }
 }
 
@@ -263,6 +379,8 @@ static void testBoundedJsonAndArenaReuse() {
   connect(client);
   for (unsigned i = 0; i < 2000; ++i) ws().emit(WStype_TEXT, event);
   assert(client.isOpened() && replies == 2000 && transcripts == 2000 && barges == 2000);
+  ws().emit(WStype_TEXT, R"({"type":"barge_in"})");
+  assert(client.isOpened() && barges == 2001);
   std::string longReply = R"({"type":"event","parameters":{"entities":[{"type":"bot_turn_response","data":{"output":")";
   longReply += std::string(2300, 'z');
   longReply += "\"}}]}}";
@@ -303,8 +421,7 @@ static void testBoundedJsonAndArenaReuse() {
        std::string(8193, ' '), manyFields, deep}) {
     ws().emit(WStype_TEXT, invalid);
     assert(!client.isOpened() && !ws().connected);
-    ws().emit(WStype_CONNECTED);
-    ws().emit(WStype_TEXT, opened);
+    connect(client);
     assert(client.isOpened());
     ws().emit(WStype_TEXT, event);
     assert(client.isOpened());
@@ -314,9 +431,11 @@ static void testBoundedJsonAndArenaReuse() {
 int main() {
   testVerifiedTlsAndCredentialRedaction();
   testSessionAndOutboundPackets();
-  testFailureClearsAndReconnectResetsSession();
+  testMultipleTurnsReuseOneSession();
+  testFailureEndsCallAndExplicitRestartResetsSession();
   testOpenedTimeoutAndMillisRollover();
   testPingDefersWhileTransportIsFull();
+  testGracefulUserClose();
   testUnsupportedOpenedRejected();
   testSendFailureClosesSession();
   testBoundedJsonAndArenaReuse();

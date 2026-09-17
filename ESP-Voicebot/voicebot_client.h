@@ -69,9 +69,8 @@ class VoicebotClient : private WebSocketsClient {
     appendQueryValue(urlPath, agentId);
     // Query strings contain the API key. Do not print the request URL.
     Serial.printf("[Voicebot] Connecting to %s:%u with verified TLS.\n", host, port);
-    setExtraHeaders("User-Agent: ESP32-Voicebot\r\nOrigin: https://voicebot-stg.botnoigroup.com");
+    setExtraHeaders("");  // Preview Call requires no custom Origin/auth headers.
     beginSslWithCA(host, port, urlPath.c_str(), ca, "");
-    setReconnectInterval(5000);
     running_ = true;
     disconnectNotified_ = false;
     return true;
@@ -81,14 +80,41 @@ class VoicebotClient : private WebSocketsClient {
     // disconnect() alone leaves the underlying reconnect timer enabled.
     running_ = false;
     disconnectNotified_ = true;
+    closeRequested_ = false;
+    closeSent_ = false;
+    closeRequestedAt_ = 0;
+    closeSentAt_ = 0;
     clearSession();
     WebSocketsClient::disconnect();
+  }
+
+  // End a user-requested call without tearing down the transport before the
+  // protocol close reaches the server. If no session has opened yet, there is
+  // no session id to close and the pending connection is stopped immediately.
+  void requestClose() {
+    if (!running_ || closeRequested_) return;
+    if (!opened_) {
+      stop();
+      return;
+    }
+    closeRequested_ = true;
+    closeSent_ = false;
+    closeRequestedAt_ = millis();
+    closeSentAt_ = 0;
+    // A transport close during this bounded grace period is expected hangup,
+    // not a failure that should notify the reconnect path.
+    disconnectNotified_ = true;
   }
 
   void loop() {
     if (!running_) return;
     WebSocketsClient::loop();
+    if (!running_) return;
     const uint32_t now = millis();
+    if (closeRequested_) {
+      serviceClose(now);
+      return;
+    }
     if (awaitingOpened_ && static_cast<uint32_t>(now - connectedAt_) >= kOpenedTimeoutMs) {
       failConnection("Timed out waiting for session opened", true);
       return;
@@ -98,15 +124,16 @@ class VoicebotClient : private WebSocketsClient {
     }
   }
 
-  bool isOpened() { return running_ && opened_ && WebSocketsClient::isConnected(); }
+  bool isRunning() const { return running_; }
+  bool isClosing() const { return running_ && closeRequested_; }
+  bool isOpened() { return running_ && opened_ && !closeRequested_ && WebSocketsClient::isConnected(); }
   // Advisory zero-timeout readiness; a failed/partial TLS send still closes.
-  bool canSendNow() const { return running_ && opened_ && WebSocketsClient::canSendNow(); }
-  bool isReceivingAudio() const { return opened_ && isReceivingBinary(); }
+  bool canSendNow() const { return running_ && opened_ && !closeRequested_ && WebSocketsClient::canSendNow(); }
+  bool isReceivingAudio() const { return opened_ && !closeRequested_ && isReceivingBinary(); }
   String getSessionId() const { return sessionId_; }
 
   bool sendAudioFrame(const uint8_t* pcm, size_t length) {
-    // Microphone packets are 20 ms PCM16 mono, 640 bytes at 16 kHz. The same
-    // method sends the loop's paced end-of-speech silence packets.
+    // Microphone packets are continuous 20 ms PCM16 mono, 640 bytes at 16 kHz.
     if (!isOpened() || !pcm || !length || length > 640 || (length & 1)) return false;
     if (sendBIN(pcm, length)) return true;
     failConnection("Audio send failed", true);
@@ -126,6 +153,8 @@ class VoicebotClient : private WebSocketsClient {
   static constexpr size_t kLogBudgetPerMessage = 512;
   static constexpr uint32_t kOpenedTimeoutMs = 15000;
   static constexpr uint32_t kPingIntervalMs = 20000;
+  static constexpr uint32_t kCloseDrainMs = 300;
+  static constexpr uint32_t kCloseSendTimeoutMs = 1000;
 
   // ArduinoJson 7's StaticJsonDocument is also heap-backed. Give it a real
   // fixed arena instead. Each document has a synchronous, message-local life;
@@ -184,10 +213,14 @@ class VoicebotClient : private WebSocketsClient {
   bool opened_ = false;
   bool awaitingOpened_ = false;
   bool disconnectNotified_ = true;
+  bool closeRequested_ = false;
+  bool closeSent_ = false;
   uint32_t seq_ = 0;
   String sessionId_;
   uint32_t lastPing_ = 0;
   uint32_t connectedAt_ = 0;
+  uint32_t closeRequestedAt_ = 0;
+  uint32_t closeSentAt_ = 0;
 
   TtsAudioCallback onTtsAudio_;
   OpenedCallback onOpened_;
@@ -251,7 +284,15 @@ class VoicebotClient : private WebSocketsClient {
 
   void failConnection(const char* reason, bool closeSocket) {
     const bool notify = running_ && !disconnectNotified_;
+    // A transport reconnect would create a different server-side session and
+    // silently lose the current conversation context. End this call instead;
+    // the application can explicitly start a new one after another button tap.
+    running_ = false;
     disconnectNotified_ = true;
+    closeRequested_ = false;
+    closeSent_ = false;
+    closeRequestedAt_ = 0;
+    closeSentAt_ = 0;
     clearSession();
     // Clear first: disconnect() can synchronously emit WStype_DISCONNECTED.
     if (closeSocket) WebSocketsClient::disconnect();
@@ -281,6 +322,43 @@ class VoicebotClient : private WebSocketsClient {
     return true;
   }
 
+  bool sendCloseNow() {
+    if (!running_ || !opened_ || !WebSocketsClient::isConnected() || seq_ == UINT32_MAX) return false;
+    const uint32_t nextSeq = seq_ + 1;
+    char envelope[256];
+    const int length = snprintf(envelope, sizeof(envelope),
+        "{\"version\":\"2\",\"type\":\"close\",\"seq\":%lu,\"id\":\"%s\",\"parameters\":{\"reason\":\"end\"}}",
+        static_cast<unsigned long>(nextSeq), sessionId_.c_str());
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(envelope) ||
+        !sendTXT(envelope, static_cast<size_t>(length))) return false;
+    seq_ = nextSeq;
+    return true;
+  }
+
+  void serviceClose(uint32_t now) {
+    if (!opened_ || !WebSocketsClient::isConnected()) {
+      stop();
+      return;
+    }
+    if (!closeSent_) {
+      if (WebSocketsClient::canSendNow()) {
+        if (!sendCloseNow()) {
+          stop();
+          return;
+        }
+        closeSent_ = true;
+        // sendTXT is synchronous and can itself consume time. Start the ACK
+        // grace only after the complete close frame has left this client.
+        closeSentAt_ = millis();
+        Serial.println("[Voicebot] Session close sent; waiting for server acknowledgment.");
+      } else if (static_cast<uint32_t>(now - closeRequestedAt_) >= kCloseSendTimeoutMs) {
+        stop();
+      }
+      return;
+    }
+    if (static_cast<uint32_t>(now - closeSentAt_) >= kCloseDrainMs) stop();
+  }
+
   void handleEvent(WStype_t type, uint8_t* bytes, size_t length) {
     if (!running_) return;
     switch (type) {
@@ -293,15 +371,17 @@ class VoicebotClient : private WebSocketsClient {
         break;
       case WStype_DISCONNECTED:
         // Transport reasons may contain a request URL: use a safe fixed message.
-        failConnection("WebSocket disconnected", false);
+        if (closeRequested_) stop();
+        else failConnection("WebSocket disconnected", false);
         break;
       case WStype_ERROR:
-        failConnection("WebSocket error", true);
+        if (closeRequested_) stop();
+        else failConnection("WebSocket error", true);
         break;
       case WStype_BIN:
         // The bounded transport emits chunks for both ordinary and fragmented
         // binary messages, including their final bytes. Text never reaches here.
-        if (opened_ && onTtsAudio_ && bytes && length) onTtsAudio_(bytes, length);
+        if (opened_ && !closeRequested_ && onTtsAudio_ && bytes && length) onTtsAudio_(bytes, length);
         break;
       case WStype_TEXT:
         if (!bytes || !length || length > kMaxJsonBytes) {
@@ -336,17 +416,23 @@ class VoicebotClient : private WebSocketsClient {
         failConnection("Invalid opened session", true);
         return;
       }
-      // Playback and microphone hardware are configured for this format only.
-      JsonArrayConst media = doc["parameters"]["media"].as<JsonArrayConst>();
-      bool supportedAudio = false;
-      for (JsonObjectConst entry : media) {
-        if (strcmp(entry["type"] | "", "audio/L16") == 0 &&
-            (entry["sampleRateHz"] | 0) == 16000 &&
-            entry["channels"].as<JsonArrayConst>().size() == 1) {
-          supportedAudio = true;
-        }
+      JsonVariantConst clientseq = doc["clientseq"];
+      if (!clientseq.is<uint32_t>() || clientseq.as<uint32_t>() == UINT32_MAX) {
+        failConnection("Invalid opened client sequence", true);
+        return;
       }
-      if (!supportedAudio || (doc["parameters"]["startPaused"] | false)) {
+      // Playback and microphone hardware are configured for exactly this one
+      // negotiated stream. Do not guess a channel or sequence on malformed
+      // handshakes; doing so would corrupt later control-message ordering.
+      JsonArrayConst media = doc["parameters"]["media"].as<JsonArrayConst>();
+      JsonVariantConst startPaused = doc["parameters"]["startPaused"];
+      JsonObjectConst entry = media.size() == 1 ? media[0].as<JsonObjectConst>() : JsonObjectConst();
+      JsonArrayConst channels = entry["channels"].as<JsonArrayConst>();
+      const bool supportedAudio = !entry.isNull() &&
+          strcmp(entry["type"] | "", "audio/L16") == 0 &&
+          (entry["sampleRateHz"] | 0) == 16000 && channels.size() == 1 &&
+          strcmp(channels[0] | "", "external") == 0;
+      if (!supportedAudio || !startPaused.is<bool>() || startPaused.as<bool>()) {
         failConnection("Unsupported session audio format", true);
         return;
       }
@@ -355,7 +441,7 @@ class VoicebotClient : private WebSocketsClient {
         failConnection("Could not allocate session identifier", true);
         return;
       }
-      seq_ = doc["clientseq"] | static_cast<uint32_t>(1);
+      seq_ = clientseq.as<uint32_t>();
       opened_ = true;
       awaitingOpened_ = false;
       lastPing_ = millis();
@@ -364,8 +450,17 @@ class VoicebotClient : private WebSocketsClient {
       return;
     }
 
+    if (strcmp(type, "closed") == 0) {
+      if (closeRequested_) stop();
+      else failConnection("Server closed the session", true);
+      return;
+    }
     if (strcmp(type, "disconnect") == 0) {
       failConnection("Server ended the session", true);
+      return;
+    }
+    if (opened_ && strcmp(type, "barge_in") == 0) {
+      if (onBargeIn_) onBargeIn_();
       return;
     }
     if (!opened_ || strcmp(type, "event")) return;

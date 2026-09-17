@@ -1,14 +1,14 @@
+diff --git a/WebSockets.cpp b/WebSockets.cpp
+index 3693bf6..f9f0cf0 100644
 --- a/WebSockets.cpp
 +++ b/WebSockets.cpp
-@@ -98 +98 @@
+@@ -98 +98 @@ uint8_t WebSockets::createHeader(uint8_t * headerPtr, WSopcode_t opcode, size_t
 -    } else if(length < 0xFFFF) {
 +    } else if(length <= 0xFFFF) {
-@@ -127 +127 @@
+@@ -127 +127 @@ uint8_t WebSockets::createHeader(uint8_t * headerPtr, WSopcode_t opcode, size_t
 -    } else if(length < 0xFFFF) {
 +    } else if(length <= 0xFFFF) {
-@@ -167,21 +166,0 @@
--}
--
+@@ -169,21 +168,0 @@ uint8_t WebSockets::createHeader(uint8_t * headerPtr, WSopcode_t opcode, size_t
 -/**
 - *
 - * @param client WSclient_t *   ptr to the client struct
@@ -28,7 +28,9 @@
 -    }
 -
 -    return true;
-@@ -201,35 +180,8 @@
+-}
+-
+@@ -201,35 +180,8 @@ bool WebSockets::sendFrame(WSclient_t * client, WSopcode_t opcode, uint8_t * pay
 -    if(client->tcp && !client->tcp->connected()) {
 -        DEBUG_WEBSOCKETS("[WS][%d][sendFrame] not Connected!?\n", client->num);
 -        return false;
@@ -72,7 +74,7 @@
 +    // The common 640-byte microphone packet and header share one TLS write.
 +    uint8_t buffer[WebSocketsStream::kChunkSize + WEBSOCKETS_MAX_HEADER_SIZE];
 +    uint8_t maskKey[4] = { 0 };
-@@ -237,84 +189,25 @@
+@@ -237,16 +189,4 @@ bool WebSockets::sendFrame(WSclient_t * client, WSopcode_t opcode, uint8_t * pay
 -        headerSize += 4;
 -    }
 -
@@ -89,7 +91,11 @@
 -            payloadPtr      = dataPtr;
 -        }
 -    }
--#endif
++#if defined(ESP32)
++        esp_fill_random(maskKey, sizeof(maskKey));
++#else
++        for(size_t i = 0; i < sizeof(maskKey); ++i) maskKey[i] = random(256);
+@@ -254,7 +193,0 @@ bool WebSockets::sendFrame(WSclient_t * client, WSopcode_t opcode, uint8_t * pay
 -
 -    // set Header Pointer
 -    if(headerToPayload) {
@@ -97,7 +103,7 @@
 -        headerPtr = (payloadPtr + (WEBSOCKETS_MAX_HEADER_SIZE - headerSize));
 -    } else {
 -        headerPtr = &buffer[0];
--    }
+@@ -262,40 +195,8 @@ bool WebSockets::sendFrame(WSclient_t * client, WSopcode_t opcode, uint8_t * pay
 -
 -    if(client->cIsClient && useInternBuffer) {
 -        // if we use a Intern Buffer we can modify the data
@@ -138,14 +144,27 @@
 -        // send header
 -        if(write(client, &buffer[0], headerSize) != headerSize) {
 -            ret = false;
--        }
++    const size_t headerSize = createHeader(buffer, opcode, length, client->cIsClient, maskKey, fin);
++    const uint8_t * source = payload ? payload + (headerToPayload ? WEBSOCKETS_MAX_HEADER_SIZE : 0) : nullptr;
++    size_t offset = 0;
++    size_t prefix = headerSize;
++    do {
++        const size_t count = std::min(length - offset, static_cast<size_t>(WebSocketsStream::kChunkSize));
++        for(size_t i = 0; i < count; ++i) {
++            buffer[prefix + i] = source[offset + i] ^ (client->cIsClient ? maskKey[(offset + i) % 4] : 0);
+@@ -303,6 +204,5 @@ bool WebSockets::sendFrame(WSclient_t * client, WSopcode_t opcode, uint8_t * pay
 -
 -        if(payloadPtr && length > 0) {
 -            // send payload
 -            if(write(client, &payloadPtr[0], length) != length) {
 -                ret = false;
 -            }
--        }
++        if(write(client, buffer, prefix + count) != prefix + count) {
++            // A partially written frame cannot be retried on this connection.
++            // Close TCP directly: sending a close frame here would corrupt it.
++            clientDisconnect(client);
++            return false;
+@@ -310,11 +210,4 @@ bool WebSockets::sendFrame(WSclient_t * client, WSopcode_t opcode, uint8_t * pay
 -    }
 -
 -    DEBUG_WEBSOCKETS("[WS][%d][sendFrame] sending Frame Done (%luus).\n", client->num, (micros() - start));
@@ -157,32 +176,11 @@
 -#endif
 -
 -    return ret;
-+#if defined(ESP32)
-+        esp_fill_random(maskKey, sizeof(maskKey));
-+#else
-+        for(size_t i = 0; i < sizeof(maskKey); ++i) maskKey[i] = random(256);
-+#endif
-+    }
-+    const size_t headerSize = createHeader(buffer, opcode, length, client->cIsClient, maskKey, fin);
-+    const uint8_t * source = payload ? payload + (headerToPayload ? WEBSOCKETS_MAX_HEADER_SIZE : 0) : nullptr;
-+    size_t offset = 0;
-+    size_t prefix = headerSize;
-+    do {
-+        const size_t count = std::min(length - offset, static_cast<size_t>(WebSocketsStream::kChunkSize));
-+        for(size_t i = 0; i < count; ++i) {
-+            buffer[prefix + i] = source[offset + i] ^ (client->cIsClient ? maskKey[(offset + i) % 4] : 0);
-+        }
-+        if(write(client, buffer, prefix + count) != prefix + count) {
-+            // A partially written frame cannot be retried on this connection.
-+            // Close TCP directly: sending a close frame here would corrupt it.
-+            clientDisconnect(client);
-+            return false;
-+        }
 +        offset += count;
 +        prefix = 0;
 +    } while(offset < length);
 +    return true;
-@@ -328,13 +221,9 @@
+@@ -328,7 +221,5 @@ void WebSockets::headerDone(WSclient_t * client) {
 -    client->status    = WSC_CONNECTED;
 -    client->cWsRXsize = 0;
 -    DEBUG_WEBSOCKETS("[WS][%d][headerDone] Header Handling Done.\n", client->num);
@@ -190,22 +188,19 @@
 -    client->cHttpLine = "";
 -    handleWebsocket(client);
 -#endif
--}
--
--/**
-- * handle the WebSocket stream
-- * @param client WSclient_t *  ptr to the client struct
-- */
 +    client->status = WSC_CONNECTED;
 +    client->rx.reset();
 +    client->rxBackpressured = false;
 +    client->httpLine = "";
 +    client->httpHeaderBytes = 0;
-+}
-+
+@@ -337,4 +228,2 @@ void WebSockets::headerDone(WSclient_t * client) {
+-/**
+- * handle the WebSocket stream
+- * @param client WSclient_t *  ptr to the client struct
+- */
 +// Read only currently available bytes. Each loop consumes at most one parser
 +// boundary and <=640 payload bytes, leaving microphone/button work responsive.
-@@ -342,43 +231,6 @@
+@@ -342,43 +231,6 @@ void WebSockets::handleWebsocket(WSclient_t * client) {
 -    if(client->cWsRXsize == 0) {
 -        handleWebsocketCb(client);
 -    }
@@ -255,7 +250,7 @@
 +    const uint32_t now = millis();
 +    if(client->rx.timedOut(now, client->rxBackpressured)) {
 +        clientDisconnect(client, 1002);
-@@ -387,9 +239,11 @@
+@@ -387,9 +239,11 @@ void WebSockets::handleWebsocketCb(WSclient_t * client) {
 -
 -    uint8_t * buffer = client->cWsHeader;
 -
@@ -276,7 +271,7 @@
 +    const uint16_t error = client->rx.consume(chunk, static_cast<size_t>(read), now, event);
 +    if(error) {
 +        clientDisconnect(client, error);
-@@ -398,43 +252,8 @@
+@@ -398,43 +252,8 @@ void WebSockets::handleWebsocketCb(WSclient_t * client) {
 -
 -    // split first 2 bytes in the data
 -    header->fin    = ((*buffer >> 7) & 0x01);
@@ -328,7 +323,7 @@
 +    } else if(event.opcode == WSop_close) {
 +        sendFrame(client, WSop_close, event.data, event.length);
 +        clientDisconnect(client);
-@@ -443,95 +262 @@
+@@ -443,95 +262 @@ void WebSockets::handleWebsocketCb(WSclient_t * client) {
 -
 -    if(header->mask) {
 -        headerLen += 4;
@@ -425,9 +420,7 @@
 -        clientDisconnect(client, 1002);
 -    }
 +    if(event.opcode) messageReceived(client, static_cast<WSopcode_t>(event.opcode), event.data, event.length, true);
-@@ -587,75 +311,0 @@
--}
--
+@@ -589,75 +313,0 @@ String WebSockets::base64_encode(uint8_t * data, size_t length) {
 -/**
 - * read x byte from tcp or get timeout
 - * @param client WSclient_t *
@@ -501,8 +494,19 @@
 -    WEBSOCKETS_YIELD();
 -#endif
 -    return true;
-@@ -698 +347,0 @@
+-}
+-
+@@ -676,0 +327,3 @@ size_t WebSockets::write(WSclient_t * client, uint8_t * out, size_t n) {
++    const unsigned long timeout = client->status == WSC_CONNECTED
++                                      ? WEBSOCKETS_IO_TIMEOUT
++                                      : WEBSOCKETS_TCP_TIMEOUT;
+@@ -691 +344 @@ size_t WebSockets::write(WSclient_t * client, uint8_t * out, size_t n) {
+-        if((millis() - t) > WEBSOCKETS_TCP_TIMEOUT) {
++        if((millis() - t) >= timeout) {
+@@ -698 +350,0 @@ size_t WebSockets::write(WSclient_t * client, uint8_t * out, size_t n) {
 -            t = millis();
+diff --git a/WebSockets.h b/WebSockets.h
+index 2a79f36..7eb5efa 100644
 --- a/WebSockets.h
 +++ b/WebSockets.h
 @@ -27,0 +28,4 @@
@@ -515,10 +519,26 @@
 @@ -66 +71 @@
 -#define WEBSOCKETS_MAX_DATA_SIZE (15 * 1024)
 +#define WEBSOCKETS_MAX_DATA_SIZE WebSocketsStream::kBinaryMessageLimit
-@@ -125 +130 @@
+@@ -125 +130,4 @@
 -#define WEBSOCKETS_TCP_TIMEOUT (5000)
 +#define WEBSOCKETS_TCP_TIMEOUT (3000)
-@@ -397,3 +402,4 @@
++#endif
++#ifndef WEBSOCKETS_IO_TIMEOUT
++#define WEBSOCKETS_IO_TIMEOUT (250)
+@@ -240 +248,11 @@
+-#define WEBSOCKETS_NETWORK_SSL_CLASS WiFiClientSecure
++// Arduino-ESP32's public setTimeout() updates socket options but not the
++// mbedTLS progress deadline captured during connect. This specialized client
++// updates both after the HTTP upgrade, bounding a stalled voice/control write.
++class VoicebotWiFiClientSecure : public WiFiClientSecure {
++  public:
++    void setVoicebotIoTimeout(unsigned long timeout) {
++        setTimeout(timeout);
++        if(sslclient) sslclient->socket_timeout = timeout;
++    }
++};
++#define WEBSOCKETS_NETWORK_SSL_CLASS VoicebotWiFiClientSecure
+@@ -397,3 +415,4 @@ typedef struct {
 -    uint8_t cWsRXsize = 0;                            ///< State of the RX
 -    uint8_t cWsHeader[WEBSOCKETS_MAX_HEADER_SIZE];    ///< RX WS Message buffer
 -    WSMessageHeader_t cWsHeaderDecode;
@@ -526,24 +546,26 @@
 +    bool rxBackpressured = false;
 +    String httpLine;
 +    size_t httpHeaderBytes = 0;
-@@ -424,6 +429,0 @@
+@@ -424,6 +442,0 @@ class WebSockets {
 -#ifdef __AVR__
 -    typedef void (*WSreadWaitCb)(WSclient_t * client, bool ok);
 -#else
 -    typedef std::function<void(WSclient_t * client, bool ok)> WSreadWaitCb;
 -#endif
 -
-@@ -435,0 +436 @@
+@@ -435,0 +449 @@ class WebSockets {
 +    virtual size_t binaryReceiveCapacity() { return SIZE_MAX; }
-@@ -438 +438,0 @@
+@@ -438 +451,0 @@ class WebSockets {
 -    bool sendFrameHeader(WSclient_t * client, WSopcode_t opcode, size_t length = 0, bool fin = true);
-@@ -444,4 +443,0 @@
--
+@@ -445,4 +457,0 @@ class WebSockets {
 -    bool handleWebsocketWaitFor(WSclient_t * client, size_t size);
 -    void handleWebsocketCb(WSclient_t * client);
 -    void handleWebsocketPayloadCb(WSclient_t * client, bool ok, uint8_t * payload);
-@@ -452 +447,0 @@
+-
+@@ -452 +460,0 @@ class WebSockets {
 -    bool readCb(WSclient_t * client, uint8_t * out, size_t n, WSreadWaitCb cb);
+diff --git a/WebSocketsClient.cpp b/WebSocketsClient.cpp
+index 007f38c..8f32ef9 100644
 --- a/WebSocketsClient.cpp
 +++ b/WebSocketsClient.cpp
 @@ -26,0 +27,4 @@
@@ -551,22 +573,22 @@
 +#if defined(ESP32)
 +#include "WebSocketsWritable.h"
 +#endif
-@@ -35,0 +40,4 @@
+@@ -35,0 +40,4 @@ WebSocketsClient::WebSocketsClient() {
 +#if defined(HAS_SSL) && defined(SSL_AXTLS)
 +    _client_cert = NULL;
 +    _client_key = NULL;
 +#endif
-@@ -45,0 +54,5 @@
+@@ -45,0 +54,5 @@ void WebSocketsClient::begin(const char * host, uint16_t port, const char * url,
 +    if(_client.tcp) clientDisconnect(&_client, "Restarting connection");
 +    _client.rx.reset();
 +    _client.rxBackpressured = false;
 +    _client.httpLine = "";
 +    _client.httpHeaderBytes = 0;
-@@ -161,0 +175,3 @@
+@@ -161,0 +175,3 @@ void WebSocketsClient::beginSSL(const char * host, uint16_t port, const char * u
 +#if defined(ESP32)
 +    _CA_bundle    = NULL;
 +#endif
-@@ -262,0 +279,9 @@
+@@ -262,0 +279,9 @@ void WebSocketsClient::loop(void) {
 +            if(!_client.ssl) {
 +                _lastConnectionFail = millis();
 +                return;
@@ -576,7 +598,7 @@
 +            _client.ssl->setHandshakeTimeout(8);
 +            _client.ssl->setTimeout(WEBSOCKETS_TCP_TIMEOUT);
 +#endif
-@@ -345,2 +370,7 @@
+@@ -345,2 +370,7 @@ void WebSocketsClient::loop(void) {
 -            handleHBPing();
 -            handleHBTimeout(&_client);
 +            if(_client.rxBackpressured) {
@@ -586,9 +608,7 @@
 +                handleHBPing();
 +                handleHBTimeout(&_client);
 +            }
-@@ -493,0 +524,9 @@
-+}
-+
+@@ -495,0 +526,9 @@ bool WebSocketsClient::isConnected(void) {
 +bool WebSocketsClient::canSendNow() const {
 +    if(_client.status != WSC_CONNECTED || !_client.tcp) return false;
 +#if defined(ESP32)
@@ -596,13 +616,15 @@
 +#else
 +    return _client.tcp->connected();
 +#endif
-@@ -559,4 +598 @@
++}
++
+@@ -559,4 +598 @@ void WebSocketsClient::clientDisconnect(WSclient_t * client, const char * reason
 -        if(client->ssl->connected()) {
 -            client->ssl->flush();
 -            client->ssl->stop();
 -        }
 +        client->ssl->stop();
-@@ -571,6 +607 @@
+@@ -571,6 +607 @@ void WebSocketsClient::clientDisconnect(WSclient_t * client, const char * reason
 -        if(client->tcp->connected()) {
 -#if (WEBSOCKETS_NETWORK_TYPE != NETWORK_ESP8266_ASYNC)
 -            client->tcp->flush();
@@ -610,26 +632,26 @@
 -            client->tcp->stop();
 -        }
 +        client->tcp->stop();
-@@ -596,0 +628,4 @@
+@@ -596,0 +628,4 @@ void WebSocketsClient::clientDisconnect(WSclient_t * client, const char * reason
 +    client->rx.reset();
 +    client->rxBackpressured = false;
 +    client->httpLine = "";
 +    client->httpHeaderBytes = 0;
-@@ -621 +656,3 @@
+@@ -621 +656,3 @@ bool WebSocketsClient::clientIsConnected(WSclient_t * client) {
 -    if(client->tcp->connected()) {
 +    // Drain already received bytes before EOF cleanup, including a final
 +    // continuation delivered together with the peer's TCP FIN.
 +    if(client->tcp->available() > 0 || client->tcp->connected()) {
-@@ -634,5 +670,0 @@
+@@ -634,5 +670,0 @@ bool WebSocketsClient::clientIsConnected(WSclient_t * client) {
 -    if(client->tcp) {
 -        // do cleanup
 -        clientDisconnect(client, "TCP connection cleanup");
 -    }
 -
-@@ -646 +678 @@
+@@ -646 +678 @@ void WebSocketsClient::handleClientData(void) {
 -    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && _lastHeaderSent + WEBSOCKETS_TCP_TIMEOUT < millis()) {
 +    if((_client.status == WSC_HEADER || _client.status == WSC_BODY) && uint32_t(millis() - _lastHeaderSent) > WEBSOCKETS_TCP_TIMEOUT) {
-@@ -653,15 +685,18 @@
+@@ -653,18 +685,18 @@ void WebSocketsClient::handleClientData(void) {
 -    int len = _client.tcp->available();
 -    if(len > 0) {
 -        switch(_client.status) {
@@ -645,6 +667,9 @@
 -            } break;
 -            case WSC_CONNECTED:
 -                WebSockets::handleWebsocket(&_client);
+-                break;
+-            default:
+-                WebSockets::clientDisconnect(&_client, 1002);
 +    if(_client.status == WSC_CONNECTED) {
 +        // Also service the inactivity timer when no bytes are available.
 +        WebSockets::handleWebsocket(&_client);
@@ -663,23 +688,20 @@
 +                String line = _client.httpLine;
 +                _client.httpLine = "";
 +                handleHeader(&_client, &line);
-@@ -669,3 +704,5 @@
--            default:
--                WebSockets::clientDisconnect(&_client, 1002);
--                break;
+@@ -671,0 +704,5 @@ void WebSocketsClient::handleClientData(void) {
 +            }
 +            if(!_client.httpLine.concat(static_cast<char>(ch))) {
 +                clientDisconnect(&_client, "HTTP response allocation failed");
 +                return;
 +            }
-@@ -688 +725,3 @@
+@@ -688 +725,3 @@ void WebSocketsClient::sendHeader(WSclient_t * client) {
 -
 +#if defined(ESP32)
 +    esp_fill_random(randomKey, sizeof(randomKey));
 +#else
-@@ -691,0 +731 @@
+@@ -691,0 +731 @@ void WebSocketsClient::sendHeader(WSclient_t * client) {
 +#endif
-@@ -745 +785,8 @@
+@@ -745 +785,8 @@ void WebSocketsClient::sendHeader(WSclient_t * client) {
 -    handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
 +    bool hasUserAgent = false;
 +    const char * extraLine = client->extraHeaders.c_str();
@@ -689,29 +711,40 @@
 +        if(extraLine) ++extraLine;
 +    }
 +    if(!hasUserAgent) handshake += WEBSOCKETS_STRING("User-Agent: arduino-WebSocket-Client\r\n");
-@@ -760 +807,4 @@
+@@ -760 +807,4 @@ void WebSocketsClient::sendHeader(WSclient_t * client) {
 -    write(client, (uint8_t *)handshake.c_str(), handshake.length());
 +    if(write(client, (uint8_t *)handshake.c_str(), handshake.length()) != handshake.length()) {
 +        clientDisconnect(client, "HTTP handshake write failed");
 +        return;
 +    }
-@@ -989,0 +1040 @@
+@@ -906,0 +957,5 @@ void WebSocketsClient::handleHeader(WSclient_t * client, String * headerLine) {
++#if defined(ESP32)
++            // Preserve the longer connect/HTTP deadlines, then keep realtime
++            // audio and hangup writes from monopolizing loop() on congestion.
++            if(client->isSSL && client->ssl) client->ssl->setVoicebotIoTimeout(WEBSOCKETS_IO_TIMEOUT);
++#endif
+@@ -989,0 +1045 @@ void WebSocketsClient::connectFailedCb() {
 +    clientDisconnect(&_client, "Connection failed");
+diff --git a/WebSocketsClient.h b/WebSocketsClient.h
+index 36c83ea..209a115 100644
 --- a/WebSocketsClient.h
 +++ b/WebSocketsClient.h
-@@ -88,0 +89,5 @@
-+
+@@ -89,0 +90,5 @@ class WebSocketsClient : protected WebSockets {
 +    // Callbacks are synchronous on the task that calls loop(). Binary events
 +    // contain <=640 bytes; fragmented text is assembled with an 8192-byte cap.
 +    void setBinaryReceiveCapacity(std::function<size_t()> cb) { _binaryCapacity = cb; }
 +    bool isReceivingBinary() const { return _client.rx.isReceivingBinary(); }
-@@ -115,0 +121,3 @@
++
+@@ -115,0 +121,3 @@ class WebSocketsClient : protected WebSockets {
 +    // ESP32: zero-timeout TCP writability check, with no receive or reconnect
 +    // side effects. False means defer sending and keep pumping loop().
 +    bool canSendNow() const;
-@@ -155,0 +164,2 @@
+@@ -155,0 +164,2 @@ class WebSocketsClient : protected WebSockets {
 +    std::function<size_t()> _binaryCapacity;
 +    size_t binaryReceiveCapacity() override { return _binaryCapacity ? _binaryCapacity() : SIZE_MAX; }
+diff --git a/WebSocketsStream.h b/WebSocketsStream.h
+new file mode 100644
+index 0000000..c43f81a
 --- /dev/null
 +++ b/WebSocketsStream.h
 @@ -0,0 +1,198 @@
@@ -913,6 +946,9 @@
 +};
 +
 +#endif
+diff --git a/WebSocketsWritable.h b/WebSocketsWritable.h
+new file mode 100644
+index 0000000..71656cd
 --- /dev/null
 +++ b/WebSocketsWritable.h
 @@ -0,0 +1,29 @@

@@ -190,10 +190,14 @@ The wire examples above describe the historical inspection. The old advice to
 allocate complete 256 KiB messages, fall back to internal malloc, disable TLS
 verification, or ignore speaker queue overflow has been superseded.
 
-The current firmware streams binary PCM in fixed 640-byte chunks, applies TCP
-backpressure when its bounded queue is full, and validates the server using the
-real GTS Root R4 certificate. It handles text/binary fragmentation separately,
-uses one task for all socket operations, and sends ordered, paced trailing
-silence. See [README.md](README.md) for current setup, RAM budgets and validation
+The current firmware follows the published persistent-call contract: the session
+button opens one WebSocket, 640-byte/20-ms microphone frames continue across
+multiple turns, and the second press sends `close(reason=end)` before transport
+shutdown. Server VAD owns utterance boundaries; the historical 500-ms synthetic
+tail above is no longer used. The client applies bounded TCP/audio backpressure,
+keeps only the latest 20-ms microphone frame while TLS is busy (rejecting audio
+older than 40 ms before upload), and validates the server using the
+real GTS Root R4 certificate. See [the official Realtime documentation](https://voicebot-stg.botnoigroup.com/docs/preview-call)
+and [README.md](README.md) for the current lifecycle, RAM budgets and validation
 limits. The 437,912-byte greeting documented here is also a host PCM regression
 fixture size; that host test does not establish on-device audio success.

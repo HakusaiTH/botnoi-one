@@ -8,7 +8,7 @@ constexpr size_t kFrameBytes = 640;
 struct AudioFrame {
   uint32_t generation;
   uint32_t capturedAt;  // Microphone only: discard stale PCM after congestion.
-  uint16_t length;  // Zero marks the end of a microphone turn.
+  uint16_t length;  // Valid queued audio is nonzero, even-length PCM16.
   uint8_t pcm[kFrameBytes];
 };
 
@@ -55,21 +55,4 @@ class PcmAssembler {
   bool hasLowByte_ = false;
 };
 
-// Start only after the microphone end marker has passed all preceding PCM.
-class SilenceTail {
- public:
-  void start(uint32_t now) { remaining_ = 25; next_ = now; }
-  void reset() { remaining_ = 0; }
-  bool active() const { return remaining_ != 0; }
-  bool due(uint32_t now) const {
-    return active() && static_cast<int32_t>(now - next_) >= 0;
-  }
-  void sent(uint32_t now) {
-    if (remaining_) --remaining_;
-    next_ = now + 20;  // Never burst delayed silence into the TCP send buffer.
-  }
- private:
-  uint32_t next_ = 0;
-  uint8_t remaining_ = 0;
-};
 }  // namespace voicebot_audio

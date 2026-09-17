@@ -954,6 +954,11 @@ void WebSocketsClient::handleHeader(WSclient_t * client, String * headerLine) {
         if(ok) {
             DEBUG_WEBSOCKETS("[WS-Client][handleHeader] Websocket connection init done.\n");
             headerDone(client);
+#if defined(ESP32)
+            // Preserve the longer connect/HTTP deadlines, then keep realtime
+            // audio and hangup writes from monopolizing loop() on congestion.
+            if(client->isSSL && client->ssl) client->ssl->setVoicebotIoTimeout(WEBSOCKETS_IO_TIMEOUT);
+#endif
 
             runCbEvent(WStype_CONNECTED, (uint8_t *)client->cUrl.c_str(), client->cUrl.length());
 #if (WEBSOCKETS_NETWORK_TYPE != NETWORK_ESP8266_ASYNC)

@@ -6,27 +6,21 @@
 
 namespace voicebot_audio {
 
+// I2S writes may return shortly before the last DMA sample leaves the pin.
+// Keep a small acoustic/DMA guard without adding a human-visible turn delay.
+constexpr uint32_t kPlaybackDrainGuardMs = 120;
+
 // Owned by loop(). The capture task reads the resulting pause decision through
 // an atomic flag; recording intent remains separate so it survives a bot reply.
 class ReplyGate {
  public:
   void reset() {
-    state_ = State::Idle;
+    playing_ = false;
     lastActivity_ = 0;
   }
 
-  void onReplyText(uint32_t now) {
-    if (state_ == State::Idle ||
-        (state_ == State::Playing && elapsed(now, lastActivity_) >= kPlaybackTailMs)) {
-      state_ = State::WaitingForAudio;
-      lastActivity_ = now;
-    }
-    // Repeated text before first audio must not indefinitely extend the wait.
-    // Text during actual playback does not replace the playback tail with 10 s.
-  }
-
   void onAudio(uint32_t now) {
-    state_ = State::Playing;
+    playing_ = true;
     lastActivity_ = now;
   }
 
@@ -35,35 +29,39 @@ class ReplyGate {
       onAudio(now);
       return true;
     }
-    if (state_ == State::Idle) return false;
-    const uint32_t limit = state_ == State::WaitingForAudio ? kFirstAudioWaitMs : kPlaybackTailMs;
-    if (elapsed(now, lastActivity_) < limit) return true;
+    if (!playing_) return false;
+    if (elapsed(now, lastActivity_) < kPlaybackDrainGuardMs) return true;
     reset();
     return false;
   }
 
  private:
-  enum class State : uint8_t { Idle, WaitingForAudio, Playing };
-  static constexpr uint32_t kFirstAudioWaitMs = 10000;
-  static constexpr uint32_t kPlaybackTailMs = 400;
   static uint32_t elapsed(uint32_t now, uint32_t then) { return now - then; }
-  State state_ = State::Idle;
+  bool playing_ = false;
   uint32_t lastActivity_ = 0;
 };
 
-// Schedule from completion of each successful write. A late write can never
-// trigger a catch-up burst, which would compete with the incoming bot audio.
+// A one-slot FreeRTOS queue is used as a latest-frame mailbox. The capture task
+// can xQueueOverwrite it atomically while loop() is busy in TLS, so recovery
+// never starts by transmitting the beginning of an old backlog.
+constexpr size_t kMicrophoneQueueFrames = 1;
+constexpr uint32_t kMicrophoneFrameMs = 20;
+constexpr uint32_t kMicrophoneMaxAgeMs = 2 * kMicrophoneFrameMs;
+
+// Schedule from the start of each successful write. TLS time is therefore not
+// added to every 20 ms packet interval. A write that takes longer than its PCM
+// duration leaves the next packet immediately due instead of slowing the stream.
 class MicrophonePacer {
  public:
   void reset() { scheduled_ = false; next_ = 0; }
   bool due(uint32_t now) const {
     return !scheduled_ || static_cast<int32_t>(now - next_) >= 0;
   }
-  void sent(uint32_t now, size_t pcmBytes) {
+  void sent(uint32_t sendStartedAt, size_t pcmBytes) {
     // PCM16, mono, 16 kHz = 32 bytes/ms. Division before rounding avoids an
     // addition overflow; actual packets are bounded by AudioFrame's 640 bytes.
     const size_t duration = pcmBytes / 32 + (pcmBytes % 32 != 0);
-    next_ = now + static_cast<uint32_t>(duration);
+    next_ = sendStartedAt + static_cast<uint32_t>(duration);
     scheduled_ = true;
   }
 
@@ -72,21 +70,18 @@ class MicrophonePacer {
   uint32_t next_ = 0;
 };
 
-// Exactly one capture producer. The loop is the only queue consumer. If the
-// network stalls, drop the newest PCM rather than removing/reordering queued
-// frames or resetting the session. Always leave one slot for the ordered end
-// marker. Both callbacks must be nonblocking; send reports the real queue result.
-template <typename Spaces, typename Send>
-bool enqueueMicrophone(const AudioFrame& frame, Spaces spaces, Send send) {
-  if (frame.length > kFrameBytes || (frame.length & 1)) return false;
-  const size_t reserved = frame.length ? 1 : 0;
-  if (static_cast<size_t>(spaces()) <= reserved) return false;
-  return send(frame);
+// xQueueOverwrite is valid only for a one-slot queue and is atomic against the
+// loop task's xQueueReceive. The callback returns the real mailbox result.
+template <typename Overwrite>
+bool overwriteMicrophone(const AudioFrame& frame, Overwrite overwrite) {
+  if (!frame.length || frame.length > kFrameBytes || (frame.length & 1)) return false;
+  return overwrite(frame);
 }
 
-// Apply to PCM only. A zero-length end marker must still be consumed even if
-// delayed, otherwise recording could remain stuck in its finishing state.
-inline bool microphoneFrameExpired(uint32_t now, uint32_t capturedAt, uint32_t maxAgeMs = 250) {
+// Drop stale PCM after a transport pause even when capture has stopped and the
+// latest-frame replacement policy is no longer advancing the mailbox.
+inline bool microphoneFrameExpired(uint32_t now, uint32_t capturedAt,
+                                   uint32_t maxAgeMs = kMicrophoneMaxAgeMs) {
   return static_cast<uint32_t>(now - capturedAt) >= maxAgeMs;
 }
 
