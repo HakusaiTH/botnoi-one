@@ -18,7 +18,7 @@ The supported target is **ESP32-S3**. Smart-speaker voice barge-in uses Espressi
 | MAX98357A | DIN | 40 |
 | MAX98357A | VIN | 5V |
 | MAX98357A | GND, GAIN | GND |
-| External LED (+ resistor) | Anode (+) | 43 |
+| External LED (+ resistor) | Anode (+) | 13 |
 | Session button (active low) | Signal | 46 |
 
 Tie INMP441 L/R to GND for the left slot. Use a common ground and 5V supply for the amplifier. The LED cathode (-) goes to GND. Session button uses internal pull-up (Released -> HIGH, Pressed -> LOW).

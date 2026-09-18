@@ -27,7 +27,7 @@
 #endif
 
 constexpr int BUTTON_SESSION = VOICEBOT_BUTTON_PIN;
-constexpr int LED_PIN = 43;
+constexpr int LED_PIN = 13;
 constexpr size_t FRAME_BYTES = voicebot_audio::kFrameBytes;
 constexpr size_t MIC_QUEUE_FRAMES = voicebot_audio::kMicrophoneQueueFrames;
 constexpr size_t SPK_PSRAM_FRAMES = 800, SPK_INTERNAL_FRAMES = 24;
