@@ -403,18 +403,21 @@ void startFace() {
   const voicebot_face::Ili9341::Pins facePins = {
       VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN,
       VOICEBOT_DISPLAY_CS_PIN, VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
-  if (faceSpi && faceDisplay.begin(facePins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ, *faceSpi) &&
+  if (faceSpi && faceDisplay.begin(facePins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ,
+      *faceSpi, voicebot_face::Layout(), voicebot_face::Palette(),
+      VOICEBOT_DISPLAY_SOFTWARE_ROTATION != 0) &&
       xTaskCreate(faceTask, "face", FACE_STACK_BYTES, nullptr, 1, &faceHandle) == pdPASS &&
       heap_caps_get_free_size(caps) >= INTERNAL_RESERVE &&
       heap_caps_get_largest_free_block(caps) >= TLS_LARGEST_BLOCK) {
     bootedAt = millis();
     xTaskNotifyGive(faceHandle);
-    Serial.printf("[FACE] ILI9341 %dx%d at %uMHz; SCK=%d MOSI=%d DC=%d CS=%d RESET=%d LED=%d; landscape rotation=%u.\n",
+    Serial.printf("[FACE] ILI9341 %dx%d at %uMHz; SCK=%d MOSI=%d DC=%d CS=%d RESET=%d LED=%d; landscape rotation=%u; mapping=%s.\n",
         int(faceDisplay.renderer().layout().width), int(faceDisplay.renderer().layout().height),
         unsigned(VOICEBOT_DISPLAY_SPI_HZ / 1000000), VOICEBOT_DISPLAY_SCK_PIN,
         VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
         VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN,
-        unsigned(VOICEBOT_DISPLAY_ROTATION));
+        unsigned(VOICEBOT_DISPLAY_ROTATION),
+        VOICEBOT_DISPLAY_SOFTWARE_ROTATION ? "software/native240x320" : "controller");
   } else {
     if (faceHandle) { vTaskDelete(faceHandle); faceHandle = nullptr; }
     faceDisplay.end();

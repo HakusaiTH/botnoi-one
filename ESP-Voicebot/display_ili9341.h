@@ -30,7 +30,8 @@ class Ili9341 {
   // Widest span a single write may cover; also sizes the byte-swap buffer.
   static const size_t kMaxSpanPixels = 320;
 
-  bool begin(const Pins& pins, uint8_t rotation, uint32_t frequency, SPIClass& bus) {
+  bool begin(const Pins& pins, uint8_t rotation, uint32_t frequency, SPIClass& bus,
+             bool softwareLandscape = false) {
     end();  // Reinitialization is supported only from the same owning task.
     if (!frequency || !validPins(pins)) return false;
     pins_ = pins;
@@ -67,13 +68,14 @@ class Ili9341 {
     send(0x01, nullptr, 0);  // SWRESET
     delay(150);
     sendInitSequence();
-    setRotation(rotation);
+    setRotation(rotation, softwareLandscape);
     running_ = true;
     return true;
   }
 
   void end() {
     if (!running_) return;
+    endWindow();
     running_ = false;
     backlight(false);
     send(0x28, nullptr, 0);  // DISPOFF
@@ -91,6 +93,18 @@ class Ili9341 {
 
   void fill(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t colour) {
     if (!running_ || w <= 0 || h <= 0) return;
+    if (softwareLandscape_) {
+      if (!validLogicalWindow(x, y, w, h)) return;
+      // A solid rectangle needs no pixel transpose. Transform its bounds and
+      // stream it directly in the panel's native 240 x 320 address space.
+      const int16_t nativeX = rotation_ == 1 ? static_cast<int16_t>(240 - y - h) : y;
+      const int16_t nativeY = rotation_ == 1 ? x : static_cast<int16_t>(320 - x - w);
+      const int16_t nativeWidth = h;
+      h = w;
+      w = nativeWidth;
+      x = nativeX;
+      y = nativeY;
+    }
     size_t span = static_cast<size_t>(w);
     if (span > kMaxSpanPixels) span = kMaxSpanPixels;
     uint16_t row[kMaxSpanPixels];
@@ -98,8 +112,9 @@ class Ili9341 {
     for (int16_t column = 0; column < w; column += static_cast<int16_t>(span)) {
       const int16_t chunk = w - column < static_cast<int16_t>(span) ? static_cast<int16_t>(w - column)
                                                                    : static_cast<int16_t>(span);
-      beginWindow(static_cast<int16_t>(x + column), y, chunk, h);
-      for (int16_t line = 0; line < h; ++line) writeRow(row, static_cast<size_t>(chunk));
+      beginPixelTransaction();
+      writeWindow(static_cast<int16_t>(x + column), y, chunk, h);
+      for (int16_t line = 0; line < h; ++line) writePixels(row, static_cast<size_t>(chunk), false);
       endWindow();
     }
   }
@@ -108,18 +123,84 @@ class Ili9341 {
   // the window and all writeRow() calls in one pixel transaction.
   void beginWindow(int16_t x, int16_t y, int16_t w, int16_t h) {
     if (!running_) return;
+    // A rejected replacement must not leave writes targeting the old window.
+    endWindow();
+    if (w <= 0 || h <= 0) return;
+    if (softwareLandscape_ && !validLogicalWindow(x, y, w, h)) return;
+    beginPixelTransaction();
+    if (softwareLandscape_) {
+      windowX_ = x;
+      windowY_ = y;
+      windowWidth_ = w;
+      windowHeight_ = h;
+      windowColumn_ = 0;
+      windowRow_ = 0;
+    } else {
+      writeWindow(x, y, w, h);
+    }
+  }
+
+  void writeRow(const uint16_t* pixels, size_t count) {
+    if (!running_ || !windowOpen_ || !pixels || !count) return;
+    if (count > kMaxSpanPixels) count = kMaxSpanPixels;
+    if (!softwareLandscape_) {
+      writePixels(pixels, count, false);
+      return;
+    }
+    // Keep MADCTL in portrait mode. A landscape row becomes a native column,
+    // so no framebuffer or transposed tile storage is needed. Splitting at a
+    // logical row boundary also preserves partial-row streaming semantics.
+    while (count && windowRow_ < windowHeight_) {
+      const size_t remaining = static_cast<size_t>(windowWidth_ - windowColumn_);
+      const size_t chunk = count < remaining ? count : remaining;
+      const int16_t x = static_cast<int16_t>(windowX_ + windowColumn_);
+      const int16_t y = static_cast<int16_t>(windowY_ + windowRow_);
+      const bool reverse = rotation_ == 3;
+      const int16_t nativeX = reverse ? y : static_cast<int16_t>(239 - y);
+      const int16_t nativeY = reverse ? static_cast<int16_t>(320 - x - chunk) : x;
+      writeWindow(nativeX, nativeY, 1, static_cast<int16_t>(chunk));
+      writePixels(pixels, chunk, reverse);
+      pixels += chunk;
+      count -= chunk;
+      windowColumn_ = static_cast<int16_t>(windowColumn_ + chunk);
+      if (windowColumn_ == windowWidth_) {
+        windowColumn_ = 0;
+        ++windowRow_;
+      }
+    }
+  }
+
+  void endWindow() {
+    if (!windowOpen_) return;
+    digitalWrite(pins_.cs, HIGH);
+    bus_->endTransaction();
+    windowOpen_ = false;
+  }
+
+ private:
+  bool validLogicalWindow(int16_t x, int16_t y, int16_t w, int16_t h) const {
+    return x >= 0 && y >= 0 && w > 0 && h > 0 &&
+           static_cast<int32_t>(x) + w <= width_ && static_cast<int32_t>(y) + h <= height_;
+  }
+
+  void beginPixelTransaction() {
+    endWindow();
+    // With no MISO readback a missed startup MADCTL write is undetectable.
+    // Reassert the selected addressing mode before CASET/PASET at a safe clock.
+    send(0x36, &madctl_, 1);
+    bus_->beginTransaction(settings_);
+    digitalWrite(pins_.cs, LOW);
+    windowOpen_ = true;
+  }
+
+  // Set a physical address window while the pixel transaction owns CS.
+  void writeWindow(int16_t x, int16_t y, int16_t w, int16_t h) {
     const uint16_t lastX = static_cast<uint16_t>(x + w - 1);
     const uint16_t lastY = static_cast<uint16_t>(y + h - 1);
     const uint8_t columns[4] = {static_cast<uint8_t>(x >> 8), static_cast<uint8_t>(x),
                                 static_cast<uint8_t>(lastX >> 8), static_cast<uint8_t>(lastX)};
     const uint8_t rows[4] = {static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(y),
                              static_cast<uint8_t>(lastY >> 8), static_cast<uint8_t>(lastY)};
-    // With no MISO readback a missed startup MADCTL write is undetectable.
-    // Reassert it before CASET/PASET, including the first full-screen clear,
-    // so landscape coordinates cannot keep using stale portrait addressing.
-    send(0x36, &madctl_, 1);
-    bus_->beginTransaction(settings_);
-    digitalWrite(pins_.cs, LOW);
     write(0x2A, columns, 4);  // CASET
     write(0x2B, rows, 4);     // PASET
     digitalWrite(pins_.dc, LOW);
@@ -127,11 +208,10 @@ class Ili9341 {
     digitalWrite(pins_.dc, HIGH);
   }
 
-  void writeRow(const uint16_t* pixels, size_t count) {
-    if (!running_ || !pixels || !count) return;
-    if (count > kMaxSpanPixels) count = kMaxSpanPixels;
+  void writePixels(const uint16_t* pixels, size_t count, bool reverse) {
     for (size_t i = 0; i < count; ++i) {
-      swap_[i] = static_cast<uint16_t>((pixels[i] << 8) | (pixels[i] >> 8));
+      const uint16_t pixel = pixels[reverse ? count - 1 - i : i];
+      swap_[i] = static_cast<uint16_t>((pixel << 8) | (pixel >> 8));
     }
     // ESP32 SPI loads whole 32-bit words, even for an odd pixel count. The
     // extra half-word remains inside this buffer and is never sent on the wire.
@@ -139,13 +219,6 @@ class Ili9341 {
     bus_->writeBytes(reinterpret_cast<const uint8_t*>(swap_), count * 2);
   }
 
-  void endWindow() {
-    if (!running_) return;
-    digitalWrite(pins_.cs, HIGH);
-    bus_->endTransaction();
-  }
-
- private:
   static bool validPins(const Pins& pins) {
     const int8_t assigned[] = {pins.sck, pins.mosi, pins.dc, pins.cs, pins.reset, pins.backlight};
     for (size_t index = 0; index < sizeof(assigned) / sizeof(assigned[0]); ++index) {
@@ -183,13 +256,16 @@ class Ili9341 {
     bus_->endTransaction();
   }
 
-  void setRotation(uint8_t rotation) {
+  void setRotation(uint8_t rotation, bool softwareLandscape) {
     // MADCTL, BGR panels. Odd rotations swap the axes into landscape.
     static const uint8_t kMadctl[4] = {0x48, 0x28, 0x88, 0xE8};
-    const uint8_t index = static_cast<uint8_t>(rotation & 0x03);
-    madctl_ = kMadctl[index];
+    rotation_ = static_cast<uint8_t>(rotation & 0x03);
+    const bool landscape = (rotation_ & 1) != 0;
+    softwareLandscape_ = softwareLandscape && landscape;
+    // Software mapping uses unmirrored native axes, matching reset addressing
+    // even when the panel misses this write; only the BGR colour bit is set.
+    madctl_ = softwareLandscape_ ? 0x08 : kMadctl[rotation_];
     send(0x36, &madctl_, 1);
-    const bool landscape = (index & 1) != 0;
     width_ = landscape ? 320 : 240;
     height_ = landscape ? 240 : 320;
   }
@@ -244,7 +320,16 @@ class Ili9341 {
   alignas(4) uint16_t swap_[kMaxSpanPixels] = {};
   int16_t width_ = 320;
   int16_t height_ = 240;
+  int16_t windowX_ = 0;
+  int16_t windowY_ = 0;
+  int16_t windowWidth_ = 0;
+  int16_t windowHeight_ = 0;
+  int16_t windowColumn_ = 0;
+  int16_t windowRow_ = 0;
   uint8_t madctl_ = 0x28;
+  uint8_t rotation_ = 1;
+  bool softwareLandscape_ = false;
+  bool windowOpen_ = false;
   bool running_ = false;
 };
 

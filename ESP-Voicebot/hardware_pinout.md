@@ -130,14 +130,17 @@ your existing credentials:
 #define VOICEBOT_DISPLAY_CS_PIN 14
 #define VOICEBOT_DISPLAY_RESET_PIN 21
 #define VOICEBOT_DISPLAY_BACKLIGHT_PIN -1
-#define VOICEBOT_DISPLAY_ROTATION 1
+#define VOICEBOT_DISPLAY_ROTATION 3
+#define VOICEBOT_DISPLAY_SOFTWARE_ROTATION 1
 #define VOICEBOT_DISPLAY_SPI_HZ 10000000
 ```
 
 Replace old button/rotation definitions and any `VOICEBOT_DISPLAY_SPI_HZ 40000000`
 override; updating `config.example.h` does not override an existing local definition.
-The face requires **320×240 landscape**: rotation `1` is the default, and `3`
-flips it by 180 degrees. Portrait values `0`/`2` fail the main firmware build with
+The face requires **320×240 landscape**: rotation `3` matches the current horizontal
+mount, and `1` flips it by 180 degrees. Software rotation maps pixels into native
+240×320 windows instead of relying on the controller's axis swap.
+Portrait values `0`/`2` fail the main firmware build with
 an explanatory message. Microphone SCK is GPIO48 and status LED is GPIO13 in
 `hardware_pins.h`; reconnect those two wires as well.
 
@@ -145,7 +148,7 @@ After uploading, the expected initialization log at 115200 baud is:
 
 ```text
 [PINS] INMP441 SCK=48 WS=2 SD=1; BUTTON=46; STATUS_LED=13.
-[FACE] ILI9341 320x240 at 10MHz; SCK=3 MOSI=45 DC=47 CS=14 RESET=21 LED=-1; landscape rotation=1.
+[FACE] ILI9341 320x240 at 10MHz; SCK=3 MOSI=45 DC=47 CS=14 RESET=21 LED=-1; landscape rotation=3; mapping=software/native240x320.
 ```
 
 The older GPIO3 audio reservation caused the display to be skipped before SPI

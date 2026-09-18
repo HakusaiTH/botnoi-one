@@ -84,10 +84,18 @@
 #define VOICEBOT_DISPLAY_BACKLIGHT_PIN -1
 #endif
 
-// The face needs 320x240 landscape: 1 is the default, 3 flips it by 180 degrees.
+// The face needs 320x240 landscape: 3 matches this panel's horizontal mount;
+// 1 turns the face 180 degrees for the opposite mounting direction.
 // Update any old config.local.h override too; portrait (0/2) cannot fit the face.
 #ifndef VOICEBOT_DISPLAY_ROTATION
-#define VOICEBOT_DISPLAY_ROTATION 1
+#define VOICEBOT_DISPLAY_ROTATION 3
+#endif
+
+// Rotate pixels into native 240x320 address windows instead of depending on
+// the controller's MADCTL axis-swap bit. The face stays logically 320x240.
+// Set to 0 only to compare the controller's hardware rotation path.
+#ifndef VOICEBOT_DISPLAY_SOFTWARE_ROTATION
+#define VOICEBOT_DISPLAY_SOFTWARE_ROTATION 1
 #endif
 
 // SPI3 keeps the panel off the bus the global Arduino SPI object claims.

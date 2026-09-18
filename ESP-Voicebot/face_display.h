@@ -15,11 +15,12 @@ namespace voicebot_face {
 class FaceDisplay {
  public:
   bool begin(const Ili9341::Pins& pins, uint8_t rotation, uint32_t frequency, SPIClass& bus,
-             const Layout& layout = Layout(), const Palette& palette = Palette()) {
+             const Layout& layout = Layout(), const Palette& palette = Palette(),
+             bool softwareLandscape = false) {
     end();
     renderer_ = FaceRenderer(layout, palette);
     if (!renderer_.valid()) return false;
-    if (!panel_.begin(pins, rotation, frequency, bus)) return false;
+    if (!panel_.begin(pins, rotation, frequency, bus, softwareLandscape)) return false;
     if (panel_.width() < layout.width || panel_.height() < layout.height) {
       panel_.end();
       return false;

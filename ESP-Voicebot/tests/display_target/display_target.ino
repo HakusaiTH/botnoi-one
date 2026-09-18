@@ -55,14 +55,16 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n[DISPLAY CHECK] ESP32-S3 ILI9341 test; no Wi-Fi, audio or credentials");
-  Serial.printf("[DISPLAY CHECK] SPI=%lu Hz rotation=%d SCK=%d MOSI=%d DC=%d CS=%d RESET=%d BACKLIGHT=%d\n",
+  Serial.printf("[DISPLAY CHECK] SPI=%lu Hz rotation=%d software_rotation=%d SCK=%d MOSI=%d DC=%d CS=%d RESET=%d BACKLIGHT=%d\n",
       static_cast<unsigned long>(DISPLAY_CHECK_SPI_HZ), VOICEBOT_DISPLAY_ROTATION,
+      VOICEBOT_DISPLAY_SOFTWARE_ROTATION,
       VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN,
       VOICEBOT_DISPLAY_CS_PIN, VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN);
   const voicebot_face::Ili9341::Pins pins = {
       VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN,
       VOICEBOT_DISPLAY_CS_PIN, VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
-  displayReady = panel.begin(pins, VOICEBOT_DISPLAY_ROTATION, DISPLAY_CHECK_SPI_HZ, displaySpi);
+  displayReady = panel.begin(pins, VOICEBOT_DISPLAY_ROTATION, DISPLAY_CHECK_SPI_HZ, displaySpi,
+      VOICEBOT_DISPLAY_SOFTWARE_ROTATION != 0);
   if (!displayReady) {
     Serial.println("[DISPLAY CHECK] FAILED: pin validation or SPI initialization. No pixels will be sent.");
     return;

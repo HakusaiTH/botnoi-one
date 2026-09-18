@@ -39,7 +39,7 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 4. With AEC ready, interrupt long replies at normal speaking volume and at several distances/angles. Repeat with quiet speech, loud playback and simultaneous speech. Barge-in must stop queued playback, keep the session, preserve the interruption's words and preserve the next reply. Confirm the bot's own voice does not trigger false interruptions. Measure mic/reference FIFO alignment and tune the finished enclosure if needed; a digital reference cannot correct amplifier clipping or mechanical vibration by itself.
 5. Exercise rapid Stop/Start and Wi-Fi loss/recovery. After Wi-Fi recovers, active Start intent opens a visibly new server session; Stop must prevent every retry. Conversation restoration after a lost transport is not documented by the API. Authorization rejection and server completion must end the call without a reconnect loop.
 6. Run for at least 30 minutes while recording `[RAM]`, `[STACK]` and `[AEC]` lines. Compare **internal free heap and largest block after equivalent idle states**; the historical minimum can only decrease. Repeat connects/disconnects. DSP processing must keep up with its 32 ms frame period; investigate repeated capture/reference overflows, alignment loss or rising microphone drops. Do not infer runtime safety from the linker RAM percentage alone.
-7. If the ILI9341 panel is wired, verify `[FACE] ILI9341 320x240` at boot and a complete face. The documented 3.3 V backlight stays lit even if initialization is skipped; it does not prove the controller received commands. Check the face is upright (otherwise set `VOICEBOT_DISPLAY_ROTATION 3`) and that the whites are white rather than inverted or blue-shifted. Confirm the mouth tracks the reply audio rather than lagging it by seconds, that the eyes blink and react while you talk, and that the frown appears on a latched audio fault. Measure whether the added SPI traffic changes `[AEC] max process`, microphone drops or the `[STACK]` minima; the face task is priority 1 and must lose to audio under load. Confirm the backlight supply, not a GPIO, carries the panel's LED current.
+7. If the ILI9341 panel is wired, verify `[FACE] ILI9341 320x240` at boot and a complete face. The documented 3.3 V backlight stays lit even if initialization is skipped; it does not prove the controller received commands. Check the face is upright (otherwise set `VOICEBOT_DISPLAY_ROTATION 1`) and that the whites are white rather than inverted or blue-shifted. Confirm the mouth tracks the reply audio rather than lagging it by seconds, that the eyes blink and react while you talk, and that the frown appears on a latched audio fault. Measure whether the added SPI traffic changes `[AEC] max process`, microphone drops or the `[STACK]` minima; the face task is priority 1 and must lose to audio under load. Confirm the backlight supply, not a GPIO, carries the panel's LED current.
 8. Check stack minima remain comfortably above zero during the busiest operations. Persistent low headroom requires adjustment and retesting on that board. Investigate any panic, watchdog reset, heap error or declining idle heap before treating the firmware as hardware validated.
 
 ## Log interpretation
@@ -64,13 +64,19 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 
 The supplied photo does not identify a unique cause. The linked board reference agrees with the configured ILI9341 signals, and host checks exercise RGB565 byte order, complete frame clearing and command/data boundaries. Those checks cannot establish signal integrity, panel identity or supply stability.
 
-For a face that stays portrait with a clipped/striped right eye and an uncleared
-bottom strip, check `VOICEBOT_DISPLAY_ROTATION 1` (or `3` for reversed landscape)
-in any local configuration. The renderer needs 320×240, and the main sketch now
-rejects portrait overrides at compile time. The driver also reasserts MADCTL at
-at most 1 MHz before every drawing window. This addresses a potentially missed
-orientation command; the photograph alone does not prove that was the cause.
-Confirm the result on the actual panel after uploading.
+The connected panel remained in portrait coordinates after the hardware-rotation
+retry was flashed: the supplied horizontal-mount photo shows a sideways face,
+a clipped eye and an uncleared strip. The startup log described the requested
+orientation, not a readback of the panel. The underlying reason the controller
+rotation failed is not yet established.
+
+The default now uses `VOICEBOT_DISPLAY_ROTATION 3` with
+`VOICEBOT_DISPLAY_SOFTWARE_ROTATION 1`. It rotates the pixel stream in software,
+writing only native 240×320 windows with unmirrored MADCTL addressing. Logical
+rows become native columns, and solid-clear bounds are transformed too. Rotation
+`1` supports the opposite mounting direction. The existing row buffers suffice;
+no framebuffer is allocated. Use software rotation `0` only to compare the
+controller's hardware rotation. Confirm the visual result after uploading.
 
 Update existing `config.local.h` overrides to `VOICEBOT_DISPLAY_SPI_HZ 10000000`; old local values still override the new default. If noise remains, use the [display-only diagnostic](tests/display_target/README.md) at its 1 MHz default. It cycles labelled solid colours and patterns with no microphone, speaker or Wi-Fi initialization. This also bypasses the production audio-startup/memory guards that can intentionally skip the display.
 
@@ -80,7 +86,45 @@ Clock reference: ILI9341 specification, section 18.3.4, [four-line SPI timing, p
 
 ## Validation scope
 
-The repository includes reproducible Arduino builds for PSRAM enabled/disabled, sanitizer-backed host tests and a standalone actual ESP-SR DSP fixture. The current changes have not been flashed to a connected ESP32 in this session. The ILI9341 face has **not** run on a physical panel: its host suites cover the animation, the rasterized pixels, the command stream and the byte order, but rotation, colour order, backlight wiring, SPI timing margin and the visual result are unmeasured. Hardware audio quality, runtime TLS peaks, power stability, echo behavior and long-session context remain to be measured on the actual device. The supplied log shows application-triggered session reconnections with available internal RAM; it does not contain a boot banner, panic or reset cause establishing an ESP32 reboot.
+The repository includes reproducible Arduino builds, sanitizer-backed host tests
+and an actual ESP-SR DSP fixture. The pin-update firmware was flashed over USB
+with its application hash verified. Boot monitoring confirmed GPIO48/46/13,
+8 MB PSRAM, AEC startup and Wi-Fi association without a crash. The subsequent
+photo demonstrated that controller rotation still left the face sideways.
+Software command-stream tests and boot logs do not verify physical orientation,
+colour order or signal integrity. Audio quality, voice calls, runtime TLS peaks,
+power stability, echo behavior and long-session context still need device tests.
+
+### Native-window software landscape checked on 2026-09-18
+
+The previous controller-rotation retry did not resolve the photographed sideways
+face. Production now uses rotation `3` with software mapping into native
+240×320 windows and MADCTL `0x08` (no spatial-axis bits). Both the full clear
+and dirty regions use transformed coordinates. No pixel buffer or task was added;
+static RAM increases by 16 bytes for mapping state and alignment.
+
+All **15 host suites** passed AddressSanitizer/UndefinedBehaviorSanitizer. The
+panel suite interprets the actual SPI byte stream as native portrait GRAM and
+checks every pixel of an asymmetric landscape image for rotations `1` and `3`,
+full clears, corner fills, partial/cross-row writes, invalid-window replacement
+and untouched regions after a mouth update. Removing rotation `3` pixel reversal
+makes the image comparison fail.
+
+The configured OPI-PSRAM firmware builds without warnings with ESP32 core 3.3.11
+and ArduinoJson 7.4.3: 1,192,227 sketch bytes and 83,340 static RAM bytes. Its
+1,192,368-byte image fits the existing `0x140000` application partition. The saved
+settings and existing partition layout were checked against the previous build.
+The display-only fixture also builds without warnings: 309,758 sketch bytes and
+23,568 static RAM bytes. Private deployment artifacts are under
+`build/device-landscape-6vhpsrwp/`; the credential-free diagnostic is under
+`build/display-check-n3f2ancr/`.
+
+The configured software-rotation image was flashed with its hash verified. A
+45-second boot capture confirmed the new mapping, pins, PSRAM, AEC, Wi-Fi and no
+crash or RX/reference/DMA drops. The user then reported that the physical face
+was **still sideways and corrupted**. This attempt therefore did not resolve the
+display fault. An independent Adafruit software-SPI diagnostic is being used to
+check panel communication at a deliberately slower clock.
 
 ### New pins and landscape retry validated on 2026-09-18
 

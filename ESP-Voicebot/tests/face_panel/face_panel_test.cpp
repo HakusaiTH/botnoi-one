@@ -48,7 +48,8 @@ int projectPinConflict(const Ili9341::Pins& pins) {
 // the real panel path. No copied list of supposedly occupied GPIOs lives here.
 bool beginProjectDisplay(FaceDisplay& display, const Ili9341::Pins& pins, SPIClass& bus) {
   if (projectPinConflict(pins) >= 0) return false;
-  return display.begin(pins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ, bus);
+  return display.begin(pins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ, bus,
+      Layout(), Palette(), VOICEBOT_DISPLAY_SOFTWARE_ROTATION != 0);
 }
 
 // Finds a command byte followed by its parameters in the recorded stream.
@@ -105,6 +106,95 @@ uint32_t commandTime(const SPIClass& bus, uint8_t command) {
   return 0;
 }
 
+// A native portrait controller model. It interprets physical CASET/PASET and
+// sequential RGB565 writes only; it knows nothing about the driver's rotation
+// formulas. MADCTL can have no spatial effect here, as on the reported panel.
+class NativeGram {
+ public:
+  NativeGram() : pixels(240u * 320u, 0x5AA5), writes(240u * 320u, 0) {}
+
+  void consume(const SPIClass& bus) {
+    size_t start = 0;
+    while (start < bus.bytes.size()) {
+      assert(levelAtByte(bus, start, kDc) == LOW);
+      assert(levelAtByte(bus, start, kCs) == LOW);
+      size_t end = start + 1;
+      while (end < bus.bytes.size() && levelAtByte(bus, end, kDc) == HIGH) {
+        assert(levelAtByte(bus, end, kCs) == LOW);
+        ++end;
+      }
+      const size_t length = end - start - 1;
+      const uint8_t* payload = bus.bytes.data() + start + 1;
+      switch (bus.bytes[start]) {
+        case 0x36:
+          // No mirrored axes or MV swap: receiving or losing this write must
+          // leave the same coordinate system (colour interpretation may differ).
+          assert(length == 1 && payload[0] == 0x08);
+          ++orientationWrites;
+          break;
+        case 0x2A:
+        case 0x2B: {
+          assert(length == 4);
+          const uint16_t first = static_cast<uint16_t>((payload[0] << 8) | payload[1]);
+          const uint16_t last = static_cast<uint16_t>((payload[2] << 8) | payload[3]);
+          assert(first <= last);
+          if (bus.bytes[start] == 0x2A) {
+            assert(last < 240);
+            x_ = first;
+            lastX_ = last;
+          } else {
+            assert(last < 320);
+            y_ = first;
+            lastY_ = last;
+          }
+          break;
+        }
+        case 0x2C: {
+          const size_t width = lastX_ - x_ + 1;
+          const size_t height = lastY_ - y_ + 1;
+          assert(length == width * height * 2);
+          for (size_t pixel = 0; pixel < width * height; ++pixel) {
+            const size_t nativeX = x_ + pixel % width;
+            const size_t nativeY = y_ + pixel / width;
+            const size_t address = nativeY * 240 + nativeX;
+            pixels[address] = static_cast<uint16_t>((payload[pixel * 2] << 8) | payload[pixel * 2 + 1]);
+            ++writes[address];
+          }
+          ++windows;
+          break;
+        }
+        default: break;  // Initialization and display-power commands.
+      }
+      start = end;
+    }
+  }
+
+  // View the physical panel in the selected landscape mounting. Inverse
+  // coordinates are independent of how the driver splits/reverses rows.
+  void expectLandscape(const std::vector<uint16_t>& logical, uint8_t rotation) const {
+    assert(logical.size() == 320u * 240u && (rotation == 1 || rotation == 3));
+    for (size_t nativeY = 0; nativeY < 320; ++nativeY) {
+      for (size_t nativeX = 0; nativeX < 240; ++nativeX) {
+        const size_t logicalX = rotation == 1 ? nativeY : 319 - nativeY;
+        const size_t logicalY = rotation == 1 ? 239 - nativeX : nativeX;
+        assert(pixels[nativeY * 240 + nativeX] == logical[logicalY * 320 + logicalX]);
+      }
+    }
+  }
+
+  void clearWriteCounts() {
+    for (size_t i = 0; i < writes.size(); ++i) writes[i] = 0;
+  }
+
+  std::vector<uint16_t> pixels;
+  std::vector<uint16_t> writes;
+  size_t windows = 0;
+  size_t orientationWrites = 0;
+
+ private:
+  uint16_t x_ = 0, lastX_ = 239, y_ = 0, lastY_ = 319;
+};
+
 }  // namespace
 
 static void configured_goouuu_pins_pass_the_project_guard_and_initialize_the_panel() {
@@ -114,7 +204,8 @@ static void configured_goouuu_pins_pass_the_project_guard_and_initialize_the_pan
   const Ili9341::Pins pins = configuredWiring();
   assert(pins.sck == 3 && pins.backlight == -1);
   assert(VOICEBOT_DISPLAY_SPI_HZ == 10000000);
-  assert(VOICEBOT_DISPLAY_ROTATION == 1);
+  assert(VOICEBOT_DISPLAY_ROTATION == 3);
+  assert(VOICEBOT_DISPLAY_SOFTWARE_ROTATION == 1);
   assert(voicebot_hardware::kMicrophoneBclk == 48);
   assert(VOICEBOT_BUTTON_PIN == 46);
   assert(voicebot_hardware::kStatusLed == 13);
@@ -127,6 +218,7 @@ static void configured_goouuu_pins_pass_the_project_guard_and_initialize_the_pan
   assert(bus.sck == pins.sck && bus.mosi == pins.mosi);
   assert(sent(bus.bytes, std::vector<uint8_t>{0x11}));  // Sleep out.
   assert(sent(bus.bytes, std::vector<uint8_t>{0x29}));  // Display on.
+  expectCommand(bus, 0x36, {0x08});
   bus.bytes.clear();
   display.update(FaceFrame());
   assert(!bus.bytes.empty());
@@ -509,6 +601,177 @@ static void fill_covers_every_pixel_of_the_rectangle() {
   panel.end();
 }
 
+static void software_landscape_clears_the_entire_native_panel_and_rotates_asymmetric_pixels() {
+  const uint8_t rotations[] = {1, 3};
+  for (uint8_t rotation : rotations) {
+    arduino_stub::clear();
+    SPIClass bus(HSPI);
+    Ili9341 panel;
+    assert(panel.begin(wiring(), rotation, 10000000, bus, true));
+    assert(panel.width() == 320 && panel.height() == 240);
+    panel.fill(0, 0, 320, 240, 0xFFFF);
+    NativeGram gram;
+    gram.consume(bus);
+    assert(gram.windows == 1 && gram.orientationWrites == 2);
+    for (size_t i = 0; i < gram.pixels.size(); ++i) {
+      assert(gram.pixels[i] == 0xFFFF && gram.writes[i] == 1);
+    }
+
+    // Deliberately asymmetric across both axes, with distinctive corner
+    // colours, so transpose, mirror, missing columns and byte swaps disagree.
+    std::vector<uint16_t> logical(320u * 240u);
+    for (size_t y = 0; y < 240; ++y) {
+      for (size_t x = 0; x < 320; ++x) {
+        logical[y * 320 + x] = static_cast<uint16_t>(0x1234u + x * 71u + y * 353u);
+      }
+    }
+    logical[0] = 0xF800;
+    logical[319] = 0x07E0;
+    logical[239u * 320u] = 0x001F;
+    logical.back() = 0xABCD;
+    bus.bytes.clear();
+    gram.clearWriteCounts();
+    panel.beginWindow(0, 0, 320, 240);
+    for (size_t y = 0; y < 240; ++y) panel.writeRow(logical.data() + y * 320, 320);
+    panel.endWindow();
+    gram.consume(bus);
+    gram.expectLandscape(logical, rotation);
+    for (uint16_t count : gram.writes) assert(count == 1);
+    assert(bus.depth == 0 && arduino_stub::levelOf(kCs) == HIGH);
+    panel.end();
+  }
+}
+
+static void software_landscape_preserves_partial_streams_corners_and_untouched_pixels() {
+  const uint8_t rotations[] = {1, 3};
+  for (uint8_t rotation : rotations) {
+    arduino_stub::clear();
+    SPIClass bus(HSPI);
+    Ili9341 panel;
+    assert(panel.begin(wiring(), rotation, 10000000, bus, true));
+    panel.fill(0, 0, 320, 240, 0xFFFF);
+    NativeGram gram;
+    gram.consume(bus);
+    std::vector<uint16_t> logical(320u * 240u, 0xFFFF);
+    bus.bytes.clear();
+    gram.clearWriteCounts();
+
+    // Solid dirty rectangles exercise the fast fill path at every corner.
+    const Rect corners[] = {{0, 0, 2, 3}, {318, 0, 2, 3},
+                            {0, 237, 2, 3}, {318, 237, 2, 3}};
+    const uint16_t colours[] = {0xF800, 0x07E0, 0x001F, 0xABCD};
+    for (size_t i = 0; i < 4; ++i) {
+      const Rect rect = corners[i];
+      panel.fill(rect.x, rect.y, rect.w, rect.h, colours[i]);
+      for (int y = rect.y; y < rect.y + rect.h; ++y) {
+        for (int x = rect.x; x < rect.x + rect.w; ++x) logical[y * 320 + x] = colours[i];
+      }
+    }
+
+    const Rect partial = {17, 23, 7, 3};
+    uint16_t source[24];
+    for (size_t i = 0; i < 24; ++i) source[i] = static_cast<uint16_t>(0x8100 + i * 37);
+    panel.beginWindow(partial.x, partial.y, partial.w, partial.h);
+    // Calls start/end midway through rows; the last call extends beyond the
+    // window. Rotation 3 must reverse each native segment without reversing
+    // the logical stream or writing the final three excess pixels.
+    const size_t chunks[] = {2, 8, 1, 9, 4};
+    size_t consumed = 0;
+    for (size_t count : chunks) {
+      panel.writeRow(source + consumed, count);
+      consumed += count;
+    }
+    const size_t completeSize = bus.bytes.size();
+    panel.writeRow(source, 1);  // The completed window accepts no more pixels.
+    assert(bus.bytes.size() == completeSize);
+    panel.endWindow();
+    panel.writeRow(source, 1);  // Nor does a closed window.
+    assert(bus.bytes.size() == completeSize);
+    for (size_t i = 0; i < 21; ++i) {
+      logical[(partial.y + i / 7) * 320 + partial.x + i % 7] = source[i];
+    }
+    gram.consume(bus);
+    gram.expectLandscape(logical, rotation);
+    size_t touched = 0;
+    for (uint16_t count : gram.writes) {
+      assert(count <= 1);
+      touched += count;
+    }
+    assert(touched == 4u * 2u * 3u + 21u);
+
+    bus.bytes.clear();
+    panel.beginWindow(10, 10, 2, 2);
+    const size_t beforeInvalid = bus.bytes.size();
+    panel.beginWindow(319, 239, 2, 2);  // Must close the previous valid window.
+    panel.writeRow(source, 4);
+    panel.endWindow();
+    assert(bus.bytes.size() == beforeInvalid);
+    assert(bus.depth == 0 && arduino_stub::levelOf(kCs) == HIGH);
+    bus.bytes.clear();
+    const Rect invalid[] = {{-1, 0, 1, 1}, {0, -1, 1, 1}, {320, 0, 1, 1},
+                            {0, 240, 1, 1}, {0, 0, 0, 1}, {0, 0, 1, -1}};
+    for (const Rect& rect : invalid) {
+      panel.fill(rect.x, rect.y, rect.w, rect.h, 0);
+      panel.beginWindow(rect.x, rect.y, rect.w, rect.h);
+      panel.writeRow(source, 1);
+      panel.endWindow();
+    }
+    assert(bus.bytes.empty() && bus.depth == 0);
+    panel.end();
+  }
+}
+
+static void software_landscape_face_updates_only_the_dirty_mouth_in_native_gram() {
+  const uint8_t rotations[] = {1, 3};
+  for (uint8_t rotation : rotations) {
+    arduino_stub::clear();
+    SPIClass bus(HSPI);
+    FaceDisplay display;
+    assert(display.begin(wiring(), rotation, 10000000, bus, Layout(), Palette(), true));
+    FaceFrame frame;
+    frame.gazeX = 7;
+    frame.leftEyeOpen = 150;
+    display.update(frame);
+    NativeGram gram;
+    gram.consume(bus);
+    std::vector<uint16_t> logical(320u * 240u, 0xFFFF);
+    const FaceRenderer& renderer = display.renderer();
+    uint16_t row[FaceRenderer::kMaxRegionWidth];
+    for (uint8_t region = 0; region < FaceRenderer::kRegionCount; ++region) {
+      const Rect rect = renderer.region(region);
+      for (int16_t y = 0; y < rect.h; ++y) {
+        renderer.renderRow(region, frame, y, row);
+        for (int16_t x = 0; x < rect.w; ++x) logical[(rect.y + y) * 320 + rect.x + x] = row[x];
+      }
+    }
+    gram.expectLandscape(logical, rotation);
+    bus.bytes.clear();
+    display.update(frame);
+    assert(bus.bytes.empty());
+
+    gram.clearWriteCounts();
+    frame.mouthOpen = 200;
+    display.update(frame);
+    gram.consume(bus);
+    const Rect mouth = renderer.region(FaceRenderer::kMouth);
+    for (int16_t y = 0; y < mouth.h; ++y) {
+      renderer.renderRow(FaceRenderer::kMouth, frame, y, row);
+      for (int16_t x = 0; x < mouth.w; ++x) logical[(mouth.y + y) * 320 + mouth.x + x] = row[x];
+    }
+    gram.expectLandscape(logical, rotation);
+    for (int16_t nativeY = 0; nativeY < 320; ++nativeY) {
+      for (int16_t nativeX = 0; nativeX < 240; ++nativeX) {
+        const int16_t x = rotation == 1 ? nativeY : 319 - nativeY;
+        const int16_t y = rotation == 1 ? 239 - nativeX : nativeX;
+        const bool inside = x >= mouth.x && x < mouth.x + mouth.w &&
+                            y >= mouth.y && y < mouth.y + mouth.h;
+        assert(gram.writes[nativeY * 240 + nativeX] == (inside ? 1 : 0));
+      }
+    }
+    display.end();
+  }
+}
+
 static void the_first_face_paints_everything_and_lights_the_backlight() {
   arduino_stub::clear();
   SPIClass bus(HSPI);
@@ -624,6 +887,9 @@ int main() {
   a_window_write_sends_exact_bounds_and_big_endian_pixels();
   odd_and_maximum_rows_use_safe_bulk_storage_without_extra_wire_pixels();
   fill_covers_every_pixel_of_the_rectangle();
+  software_landscape_clears_the_entire_native_panel_and_rotates_asymmetric_pixels();
+  software_landscape_preserves_partial_streams_corners_and_untouched_pixels();
+  software_landscape_face_updates_only_the_dirty_mouth_in_native_gram();
   the_first_face_paints_everything_and_lights_the_backlight();
   only_changed_regions_reach_the_bus();
   a_layout_the_renderer_rejects_never_opens_the_panel();

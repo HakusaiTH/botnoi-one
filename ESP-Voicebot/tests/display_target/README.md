@@ -7,6 +7,12 @@ at 115200 baud. There is no Wi-Fi, audio, voicebot session or framebuffer;
 pixels use fixed row buffers. Arduino and SPI still allocate their normal
 runtime control state.
 
+The current defaults use rotation `3` and software rotation: pixels are mapped
+into native 240×320 address windows while the pattern remains logically
+320×240. Rotation `1` supports the opposite mounting direction. To compare
+hardware rotation, set `VOICEBOT_DISPLAY_SOFTWARE_ROTATION` to `0` in the
+generated configuration and rebuild.
+
 From the repository root, using an existing Arduino CLI and ESP32 core 3.3.11:
 
 ```sh
