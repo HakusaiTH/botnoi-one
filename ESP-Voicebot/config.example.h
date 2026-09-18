@@ -30,10 +30,9 @@
 #define BOTNOI_WS_PORT 443
 #endif
 
-// GPIO46 preserves the existing wiring. It is an ESP32-S3 boot strapping pin;
-// see README before adding an external pull resistor. GPIO4 is an alternative.
+// GPIO4 active-low session button (Released -> HIGH, Pressed -> LOW).
 #ifndef VOICEBOT_BUTTON_PIN
-#define VOICEBOT_BUTTON_PIN 46
+#define VOICEBOT_BUTTON_PIN 4
 #endif
 
 // Native ESP-SR full-duplex echo cancellation. Requires ESP32-S3 with working

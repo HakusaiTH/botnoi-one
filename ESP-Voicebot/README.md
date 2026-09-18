@@ -8,18 +8,20 @@ The supported target is **ESP32-S3**. Smart-speaker voice barge-in uses Espressi
 
 | Device | Signal | ESP32-S3 GPIO |
 | --- | --- | ---: |
-| INMP441 | BCLK / SCK | 3 |
+| INMP441 | BCLK / SCK | 48 |
 | INMP441 | WS / LRCLK | 2 |
 | INMP441 | DOUT / SD | 1 |
+| INMP441 | L/R, GND | GND |
+| INMP441 | VCC | 3.3V |
 | MAX98357A | BCLK | 38 |
 | MAX98357A | LRC | 39 |
 | MAX98357A | DIN | 40 |
-| External LED, with series resistor | Anode | 48 |
-| Session button, other side to GND | Signal | 46 |
+| MAX98357A | VIN | 5V |
+| MAX98357A | GND, GAIN | GND |
+| External LED (+ resistor) | Anode (+) | 43 |
+| Session button (active low) | Signal | 4 |
 
-Tie INMP441 L/R to GND for the left slot. Use a common ground and suitable power supply for the amplifier. The LED code expects an ordinary external LED, not an addressable RGB LED.
-
-GPIO46 is a boot strapping pin. Preserve the existing wiring if it works; for a new design, GPIO4 is a convenient talk-button alternative: set `VOICEBOT_BUTTON_PIN 4` in `config.local.h`. Do not add a pull-up on GPIO46 without checking the board's boot/download requirements. [Espressif boot-mode documentation](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/advanced-topics/boot-mode-selection.html).
+Tie INMP441 L/R to GND for the left slot. Use a common ground and 5V supply for the amplifier. The LED cathode (-) goes to GND. Session button uses internal pull-up (Released -> HIGH, Pressed -> LOW).
 
 ## Build and run
 
