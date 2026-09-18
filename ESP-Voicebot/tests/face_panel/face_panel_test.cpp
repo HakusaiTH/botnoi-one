@@ -2,6 +2,8 @@
 // tests cannot prove the panel lights up, but they do pin down the command
 // stream, the pixel byte order and which regions actually reach the bus.
 #include "../../face_display.h"
+#include "../../config.example.h"
+#include "../../hardware_pins.h"
 
 #include <cassert>
 #include <cstdio>
@@ -17,11 +19,36 @@ using voicebot_face::Rect;
 
 namespace {
 
-const int8_t kSck = 3, kMosi = 45, kDc = 47, kCs = 14, kReset = 21, kBacklight = -1;
+const int8_t kSck = VOICEBOT_DISPLAY_SCK_PIN, kMosi = VOICEBOT_DISPLAY_MOSI_PIN,
+             kDc = VOICEBOT_DISPLAY_DC_PIN, kCs = VOICEBOT_DISPLAY_CS_PIN,
+             kReset = VOICEBOT_DISPLAY_RESET_PIN;
+// Driver backlight tests need a controllable GPIO. The configured board's
+// permanently powered backlight is exercised separately below.
+const int8_t kBacklight = 41;
+
+Ili9341::Pins configuredWiring() {
+  const Ili9341::Pins pins = {VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN,
+      VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
+      VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
+  return pins;
+}
 
 Ili9341::Pins wiring() {
   const Ili9341::Pins pins = {kSck, kMosi, kDc, kCs, kReset, kBacklight};
   return pins;
+}
+
+int projectPinConflict(const Ili9341::Pins& pins) {
+  const int assigned[] = {pins.sck, pins.mosi, pins.dc, pins.cs, pins.reset, pins.backlight};
+  return voicebot_hardware::displayPinConflict(assigned,
+      sizeof(assigned) / sizeof(assigned[0]), VOICEBOT_BUTTON_PIN);
+}
+
+// Uses the same production admission helper as startFace(), then exercises
+// the real panel path. No copied list of supposedly occupied GPIOs lives here.
+bool beginProjectDisplay(FaceDisplay& display, const Ili9341::Pins& pins, SPIClass& bus) {
+  if (projectPinConflict(pins) >= 0) return false;
+  return display.begin(pins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ, bus);
 }
 
 // Finds a command byte followed by its parameters in the recorded stream.
@@ -41,6 +68,74 @@ bool sent(const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& sequenc
 }
 
 }  // namespace
+
+static void configured_goouuu_pins_pass_the_project_guard_and_initialize_the_panel() {
+  arduino_stub::clear();
+  SPIClass bus(HSPI);
+  FaceDisplay display;
+  const Ili9341::Pins pins = configuredWiring();
+  assert(pins.sck == 3 && pins.backlight == -1);
+  assert(voicebot_hardware::kMicrophoneBclk == 42);
+  // GPIO3 used to be the microphone clock. Reserving it after the I2S move
+  // disabled the display before SPI initialization, leaving a white screen.
+  assert(!voicebot_hardware::audioUsesPin(pins.sck));
+  assert(projectPinConflict(pins) == -1);
+  assert(beginProjectDisplay(display, pins, bus));
+  assert(display.running() && bus.started);
+  assert(bus.sck == pins.sck && bus.mosi == pins.mosi);
+  assert(sent(bus.bytes, std::vector<uint8_t>{0x11}));  // Sleep out.
+  assert(sent(bus.bytes, std::vector<uint8_t>{0x29}));  // Display on.
+  bus.bytes.clear();
+  display.update(FaceFrame());
+  assert(!bus.bytes.empty());
+  display.end();
+  assert(arduino_stub::levelOf(-1) == -1);
+  for (int pin : arduino_stub::modes) assert(pin >= 0);
+  for (const auto& event : arduino_stub::writes) assert(event.pin >= 0);
+}
+
+static void every_active_audio_button_and_status_pin_is_rejected_before_hardware_use() {
+  using namespace voicebot_hardware;
+  const int reserved[] = {kMicrophoneBclk, kMicrophoneWs, kMicrophoneData,
+      kSpeakerBclk, kSpeakerWs, kSpeakerData, VOICEBOT_BUTTON_PIN, kStatusLed};
+  for (int occupied : reserved) {
+    for (size_t role = 0; role < 6; ++role) {
+      arduino_stub::clear();
+      SPIClass bus(HSPI);
+      FaceDisplay display;
+      Ili9341::Pins pins = configuredWiring();
+      int8_t* roles[] = {&pins.sck, &pins.mosi, &pins.dc, &pins.cs, &pins.reset, &pins.backlight};
+      *roles[role] = static_cast<int8_t>(occupied);
+      assert(projectPinConflict(pins) == occupied);
+      assert(!beginProjectDisplay(display, pins, bus));
+      assert(!display.running() && bus.beginCalls == 0 && bus.bytes.empty());
+      assert(arduino_stub::modes.empty() && arduino_stub::writes.empty());
+    }
+  }
+  // The MAX98357A still receives the shared clocks through GPIO-matrix
+  // outputs 38/39, even though the primary I2S clock GPIOs are 42/2.
+  assert(audioUsesPin(kSpeakerBclk) && audioUsesPin(kSpeakerWs));
+}
+
+static void admission_honours_disabled_optional_pins_and_custom_controls() {
+  arduino_stub::clear();
+  SPIClass bus(HSPI);
+  FaceDisplay display;
+  Ili9341::Pins pins = configuredWiring();
+  pins.reset = pins.backlight = -1;
+  assert(projectPinConflict(pins) == -1);
+  assert(beginProjectDisplay(display, pins, bus));
+  assert(!bus.bytes.empty() && bus.bytes.front() == 0x01);  // Software reset.
+  display.end();
+  for (const auto& event : arduino_stub::writes) assert(event.pin >= 0);
+
+  const int optional[] = {-1, -1};
+  assert(voicebot_hardware::displayPinConflict(optional, 2, -1, -1) == -1);
+  const int customButton[] = {5};
+  const int customLed[] = {6};
+  assert(voicebot_hardware::displayPinConflict(customButton, 1, 5, 6) == 5);
+  assert(voicebot_hardware::displayPinConflict(customLed, 1, 5, 6) == 6);
+}
 
 static void bad_wiring_is_refused_and_leaves_the_bus_alone() {
   arduino_stub::clear();
@@ -342,6 +437,9 @@ static void invalid_reinitialization_closes_the_previous_display() {
 }
 
 int main() {
+  configured_goouuu_pins_pass_the_project_guard_and_initialize_the_panel();
+  every_active_audio_button_and_status_pin_is_rejected_before_hardware_use();
+  admission_honours_disabled_optional_pins_and_custom_controls();
   bad_wiring_is_refused_and_leaves_the_bus_alone();
   duplicate_and_invalid_output_pins_are_rejected_before_touching_hardware();
   failed_bus_start_is_cleaned_up_and_can_be_retried();

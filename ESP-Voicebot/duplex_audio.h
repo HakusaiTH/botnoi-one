@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "soc/gpio_sig_map.h"
 #include "duplex_timeline.h"
+#include "hardware_pins.h"
 
 #if !CONFIG_IDF_TARGET_ESP32S3
 #error "DuplexAudio clock fanout and I2S format are reviewed for ESP32-S3 only."
@@ -49,10 +50,10 @@ class DuplexAudio {
     config.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000);
     config.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
     config.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-    config.gpio_cfg.bclk = GPIO_NUM_42;
-    config.gpio_cfg.ws = GPIO_NUM_2;
-    config.gpio_cfg.dout = GPIO_NUM_40;
-    config.gpio_cfg.din = GPIO_NUM_1;
+    config.gpio_cfg.bclk = static_cast<gpio_num_t>(voicebot_hardware::kMicrophoneBclk);
+    config.gpio_cfg.ws = static_cast<gpio_num_t>(voicebot_hardware::kMicrophoneWs);
+    config.gpio_cfg.dout = static_cast<gpio_num_t>(voicebot_hardware::kSpeakerData);
+    config.gpio_cfg.din = static_cast<gpio_num_t>(voicebot_hardware::kMicrophoneData);
     // Initialization order is intentional: IDF makes the later RX channel a
     // slave sharing TX's physical clocks. No separate 16 kHz clock estimator.
     if (i2s_channel_init_std_mode(tx_, &config) != ESP_OK ||
@@ -63,13 +64,16 @@ class DuplexAudio {
     if (i2s_channel_register_event_callback(tx_, &txCallbacks, this) != ESP_OK ||
         i2s_channel_register_event_callback(rx_, &rxCallbacks, this) != ESP_OK) { end(); return false; }
     // Fan out the same TX BCLK/WS to the amplifier's existing pins. Native I2S
-    // owns GPIO3/2; these two extra matrix outputs belong exclusively to us.
+    // owns the microphone clock pins; the amplifier's two matrix outputs
+    // belong exclusively to us.
     fanout_ = true; // Also clean up a partially configured pair on failure.
-    if (gpio_reset_pin(GPIO_NUM_38) != ESP_OK || gpio_reset_pin(GPIO_NUM_39) != ESP_OK ||
-        gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT) != ESP_OK ||
-        gpio_set_direction(GPIO_NUM_39, GPIO_MODE_OUTPUT) != ESP_OK) { end(); return false; }
-    esp_rom_gpio_connect_out_signal(GPIO_NUM_38, I2S0O_BCK_OUT_IDX, false, false);
-    esp_rom_gpio_connect_out_signal(GPIO_NUM_39, I2S0O_WS_OUT_IDX, false, false);
+    const gpio_num_t speakerBclk = static_cast<gpio_num_t>(voicebot_hardware::kSpeakerBclk);
+    const gpio_num_t speakerWs = static_cast<gpio_num_t>(voicebot_hardware::kSpeakerWs);
+    if (gpio_reset_pin(speakerBclk) != ESP_OK || gpio_reset_pin(speakerWs) != ESP_OK ||
+        gpio_set_direction(speakerBclk, GPIO_MODE_OUTPUT) != ESP_OK ||
+        gpio_set_direction(speakerWs, GPIO_MODE_OUTPUT) != ESP_OK) { end(); return false; }
+    esp_rom_gpio_connect_out_signal(speakerBclk, I2S0O_BCK_OUT_IDX, false, false);
+    esp_rom_gpio_connect_out_signal(speakerWs, I2S0O_WS_OUT_IDX, false, false);
 
     // Fresh IDF DMA buffers are zeroed. Start the timeline immediately before
     // arming RX, which then waits for TX's first shared clock edge.
@@ -112,10 +116,12 @@ class DuplexAudio {
       else ok = false;
     }
     if (fanout_) {
-      esp_rom_gpio_connect_out_signal(GPIO_NUM_38, SIG_GPIO_OUT_IDX, false, false);
-      esp_rom_gpio_connect_out_signal(GPIO_NUM_39, SIG_GPIO_OUT_IDX, false, false);
-      const bool resetBclk = gpio_reset_pin(GPIO_NUM_38) == ESP_OK;
-      const bool resetWs = gpio_reset_pin(GPIO_NUM_39) == ESP_OK;
+      const gpio_num_t speakerBclk = static_cast<gpio_num_t>(voicebot_hardware::kSpeakerBclk);
+      const gpio_num_t speakerWs = static_cast<gpio_num_t>(voicebot_hardware::kSpeakerWs);
+      esp_rom_gpio_connect_out_signal(speakerBclk, SIG_GPIO_OUT_IDX, false, false);
+      esp_rom_gpio_connect_out_signal(speakerWs, SIG_GPIO_OUT_IDX, false, false);
+      const bool resetBclk = gpio_reset_pin(speakerBclk) == ESP_OK;
+      const bool resetWs = gpio_reset_pin(speakerWs) == ESP_OK;
       if (resetBclk && resetWs) fanout_ = false;
       else ok = false;
     }

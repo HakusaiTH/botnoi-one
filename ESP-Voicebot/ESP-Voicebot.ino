@@ -33,7 +33,7 @@
 #endif
 
 constexpr int BUTTON_SESSION = VOICEBOT_BUTTON_PIN;
-constexpr int LED_PIN = 48;
+constexpr int LED_PIN = voicebot_hardware::kStatusLed;
 constexpr size_t FRAME_BYTES = voicebot_audio::kFrameBytes;
 constexpr size_t MIC_QUEUE_FRAMES = voicebot_audio::kMicrophoneQueueFrames;
 constexpr size_t SPK_PSRAM_FRAMES = 800, SPK_INTERNAL_FRAMES = 24;
@@ -383,15 +383,11 @@ void startFace() {
   const int displayPins[] = {VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN,
       VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
       VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
-  const int audioPins[] = {1, 2, 3, 38, 39, 40, BUTTON_SESSION, LED_PIN};
-  for (int pin : displayPins) {
-    if (pin < 0) continue;
-    for (int reserved : audioPins) {
-      if (pin == reserved) {
-        Serial.println("[FACE] Display pin conflicts with audio/button/status LED; display disabled.");
-        return;
-      }
-    }
+  const int conflict = voicebot_hardware::displayPinConflict(
+      displayPins, sizeof(displayPins) / sizeof(displayPins[0]), BUTTON_SESSION, LED_PIN);
+  if (conflict >= 0) {
+    Serial.printf("[FACE] Display GPIO%d conflicts with audio/button/status LED; display disabled.\n", conflict);
+    return;
   }
   // Audio/AEC and Wi-Fi get their allocations first. Rendering is optional;
   // account for its stack, TCB and SPI mutexes while retaining TLS headroom.

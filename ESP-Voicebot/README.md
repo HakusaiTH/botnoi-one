@@ -6,6 +6,8 @@ The supported target is **ESP32-S3**. Smart-speaker voice barge-in uses Espressi
 
 ## Hardware
 
+The current wiring follows [hardware_pinout.md](hardware_pinout.md) for the GOOUUU ESP32-S3-CAM V1.5. Audio pins are shared between the I2S driver and display conflict checks through `hardware_pins.h`.
+
 | Device | Signal | ESP32-S3 GPIO |
 | --- | --- | ---: |
 | INMP441 | BCLK / SCK | 42 |
@@ -66,7 +68,9 @@ The mouth follows **the actual completed speaker DMA audio**, including silence 
 
 Rendering runs in its own priority-1 task, below the priority-2 audio tasks, on a 33 ms schedule. It rasterizes one row at a time into a small buffer and pushes only changed eye or mouth rectangles; quantized-identical mouth shapes do not redraw. Rendering yields even when a frame misses its deadline. The face task never touches the socket, audio queues or heap. Invalid pins, a failed SPI start or insufficient memory disable the display while the voicebot continues.
 
-Display bring-up happens **after audio/AEC and Wi-Fi initialization**. Its SPI state and 4 KiB task stack require heap, so the firmware checks the audio/TLS reserve before allocating them and again before allowing the render task to run. A startup audio failure is reported over serial before a display is started. The backlight stays off until a complete face has been drawn. Every 30 seconds `[FACE]` reports the current mood, both envelope levels and the render task's minimum unused stack.
+Display bring-up happens **after audio/AEC and Wi-Fi initialization**. Its SPI state and 4 KiB task stack require heap, so the firmware checks the audio/TLS reserve before allocating them and again before allowing the render task to run. A startup audio failure is reported over serial before a display is started. With the documented backlight connected to 3.3 V, the panel stays lit even when initialization is skipped; GPIO-controlled backlights instead stay off until a complete face is drawn. Every 30 seconds `[FACE]` reports the current mood, both envelope levels and the render task's minimum unused stack.
+
+If upgrading from the old pin map, update any display/button overrides in `config.local.h` as shown in [hardware_pinout.md](hardware_pinout.md). Existing local definitions take precedence over updated defaults. The startup conflict log now includes the exact GPIO.
 
 This is a write-only SPI connection: a successful `[FACE] ILI9341 ...` log confirms initialization was sent, but cannot detect an unplugged panel. If the screen stays blank, check its supply, backlight, reset and pin wiring. The driver sends a complete five-byte power-control command and uses a software reset when no reset GPIO is configured, following the controller sequence in [Adafruit's ILI9341 driver](https://github.com/adafruit/Adafruit_ILI9341/blob/master/Adafruit_ILI9341.cpp).
 
