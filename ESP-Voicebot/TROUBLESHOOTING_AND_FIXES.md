@@ -24,7 +24,8 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 | Unsafe partial startup | Queue, I2S or task failure could still allow normal loop execution | Networking remains disabled after startup failure, and initialized audio resources are released. Task creation is checked. |
 | Display reports success when SPI setup failed | The SPI return value was ignored and the host stub could not fail | Bus/pin initialization failure is propagated and cleaned up. Duplicate/invalid display pins and conflicts with audio/button/status LED pins are refused. |
 | White TFT after the GOOUUU pinout update | I2S BCLK moved to GPIO42 and TFT SCK to GPIO3, but the old startup guard still reserved GPIO3 and disabled the display | Driver and guard share `hardware_pins.h`; the documented TFT map passes admission and conflicts identify their GPIO. With LED tied to 3.3 V, the backlight stays white even when no initialization commands are sent. |
-| Blank or unreliable panel after restart | Truncated power-control parameters and no software reset when RESET is not wired | The full five-byte `0xCB` command is sent; no-reset-pin configurations receive `SWRESET` with its settling delay. A write-only panel still cannot report physical presence. |
+| Blank or unreliable panel after restart | Truncated power-control parameters and dependence on the configured reset wire | The full five-byte `0xCB` command is sent; all configurations also receive `SWRESET` with its settling delay. Extended setup and driver timing B follow the reference drivers. A write-only panel still cannot report physical presence. |
+| TFT writes outside the specified clock timing | The default 40 MHz write clock exceeded the ILI9341's documented 100 ns minimum write cycle | Default writes use 10 MHz; reset/configuration/rotation use at most 1 MHz. This improves timing margin but does not establish the cause of the photographed noise. Use the display-only fixture to isolate wiring/controller/power from audio load. |
 | Display reduces the audio startup reserve | The render task and SPI mutexes were allocated before AEC despite a no-heap claim | Audio/AEC and Wi-Fi initialize first; optional display allocation is admitted only with remaining TLS headroom. Failure leaves the audio pipeline active. |
 | Mouth moves before sound or changes speed under task jitter | Its envelope sampled staging submissions and rounded smoothing on every poll | The capture task follows actual played DMA reference samples. Fixed-point smoothing preserves sub-level progress across different update cadences. |
 | CPU/network starvation | Large frame reads, high-priority tasks, and blocking/bursty sends | Incremental receive work, one paced microphone packet per interval, bounded DMA callbacks and priority-2 audio tasks with queue waits and explicit capture yield. |
@@ -59,11 +60,38 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 - `[FACE] Display unavailable ...` / `Display skipped ...`: invalid/conflicting pins, SPI startup failure, incompatible layout or insufficient heap reserve. The voicebot continues without the panel. A successful initialization log is not evidence that an unplugged panel was detected; this SPI connection has no readback.
 - `[FACE] mood=...`: mood values follow `voicebot_face::Mood` (0 boot, 1 connecting, 2 idle, 3 listening, 4 speaking-wait/thinking, 5 speaking, 6 error). A mood stuck at 6 means a latched audio fault, not a display problem. Both levels are 0..255 envelope outputs; a speaker level that never leaves 0 during a reply points at the playback path rather than the panel.
 
+## Snow, coloured noise or stripes on the TFT
+
+The supplied photo does not identify a unique cause. The linked board reference agrees with the configured ILI9341 signals, and host checks exercise RGB565 byte order, complete frame clearing and command/data boundaries. Those checks cannot establish signal integrity, panel identity or supply stability.
+
+Update existing `config.local.h` overrides to `VOICEBOT_DISPLAY_SPI_HZ 10000000`; old local values still override the new default. If noise remains, use the [display-only diagnostic](tests/display_target/README.md) at its 1 MHz default. It cycles labelled solid colours and patterns with no microphone, speaker or Wi-Fi initialization. This also bypasses the production audio-startup/memory guards that can intentionally skip the display.
+
+If the isolated pattern is still wrong at 1 MHz, verify the physical pin names, controller, reset, shared ground and supply against [hardware_pinout.md](hardware_pinout.md). If it is clean alone but fails with the voicebot, compare the same SPI speed and investigate the documented expansion-board peripheral overlaps and power under audio load. No automatic test result can be inferred from successful SPI writes without readback.
+
+Clock reference: ILI9341 specification, section 18.3.4, [four-line SPI timing, page 238](https://www.displayfuture.com/Display/datasheet/controller/ILI9341.pdf#page=238). Initialization references: [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI/blob/master/TFT_Drivers/ILI9341_Init.h) and [Adafruit_ILI9341](https://github.com/adafruit/Adafruit_ILI9341/blob/master/Adafruit_ILI9341.cpp).
+
 ## Validation scope
 
 The repository includes reproducible Arduino builds for PSRAM enabled/disabled, sanitizer-backed host tests and a standalone actual ESP-SR DSP fixture. The current changes have not been flashed to a connected ESP32 in this session. The ILI9341 face has **not** run on a physical panel: its host suites cover the animation, the rasterized pixels, the command stream and the byte order, but rotation, colour order, backlight wiring, SPI timing margin and the visual result are unmeasured. Hardware audio quality, runtime TLS peaks, power stability, echo behavior and long-session context remain to be measured on the actual device. The supplied log shows application-triggered session reconnections with available internal RAM; it does not contain a boot banner, panic or reset cause establishing an ESP32 reboot.
 
-### GOOUUU pinout fix validated on 2026-09-18
+### SPI timing and display diagnostic validated on 2026-09-18
+
+All **15 host suites** passed AddressSanitizer and UndefinedBehaviorSanitizer. The panel suite now checks command/data GPIO levels for individual bytes, reset and settling delays, initialization at or below 1 MHz, the requested pixel-write speed, complete extended setup parameters and exactly 153,600 white pixel bytes for a 320×240 clear. No byte-order, transfer-length or asynchronous buffer-lifetime defect was found in the production transfer path or the pinned core's synchronous SPI writes.
+
+Arduino CLI 1.5.1 with ESP32 core 3.3.11 compiled all four targets below without warnings. Production builds use ArduinoJson 7.4.3 and dummy credentials; the standalone display check uses neither ArduinoJson nor network/audio code.
+
+| Build | Flash bytes | Static internal RAM bytes | RAM after globals |
+| --- | ---: | ---: | ---: |
+| Voicebot, display enabled, OPI PSRAM | 1,191,119 | 83,316 | 244,364 |
+| Voicebot, display enabled, PSRAM disabled | 1,185,913 | 82,864 | 244,816 |
+| Voicebot, display disabled, OPI PSRAM | 1,179,439 | 82,268 | 245,412 |
+| Display-only diagnostic, 1 MHz, PSRAM disabled | 309,358 | 23,544 | 304,136 |
+
+Production static RAM is unchanged from `7eb9046`; the driver adds no buffers or tasks. The slower SPI clock can lengthen redraws, so integrated animation/audio timing still needs hardware measurement. Runtime heap is additional to these linker figures.
+
+Logs and source manifests are in `build/compile-0rsm9fsc/`, `build/compile-zl4lypej/` and `build/display-check-23p7iozp/`. The standalone artifact includes a self-contained `DisplayCheck/DisplayCheck.ino` for manual upload. Sources match the build manifests; no ESP32 was connected and none of these binaries was uploaded. The photographed noise is therefore **not confirmed resolved on hardware**.
+
+### GOOUUU pinout baseline recorded on 2026-09-18 (`7eb9046`)
 
 The display's startup guard incorrectly reserved GPIO3 after the microphone clock moved to GPIO42. The guard and I2S driver now share the physical audio pin definitions, including the active amplifier clock fanout on GPIO38/39. The guard accepts the configured TFT wiring and reports the exact GPIO for a real conflict. This change adds no buffers, tasks or runtime allocations.
 

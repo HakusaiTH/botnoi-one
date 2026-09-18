@@ -39,6 +39,8 @@ class SPIClass {
   uint32_t transactions = 0;
   int32_t depth = 0;
   std::vector<uint8_t> bytes;        // Everything sent, in order.
-  std::vector<size_t> byteMarks;     // Index in `bytes` of each byte's DC level.
+  std::vector<size_t> byteMarks;     // Number of GPIO writes preceding each byte.
   std::vector<uint32_t> transactionTimes;
+  std::vector<size_t> transactionByteStarts;
+  std::vector<SPISettings> transactionSettings;
 };

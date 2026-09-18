@@ -67,6 +67,44 @@ bool sent(const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& sequenc
   return false;
 }
 
+int levelAtByte(const SPIClass& bus, size_t index, int pin) {
+  assert(index < bus.bytes.size() && bus.byteMarks.size() == bus.bytes.size());
+  for (size_t cursor = bus.byteMarks[index]; cursor > 0; --cursor) {
+    const auto& event = arduino_stub::writes[cursor - 1];
+    if (event.pin == pin) return event.value;
+  }
+  return -1;
+}
+
+size_t commandIndex(const SPIClass& bus, uint8_t command) {
+  for (size_t index = 0; index < bus.bytes.size(); ++index) {
+    if (bus.bytes[index] == command && levelAtByte(bus, index, kDc) == LOW) return index;
+  }
+  assert(false && "Expected command was not sent with DC low");
+  return bus.bytes.size();
+}
+
+void expectCommand(const SPIClass& bus, uint8_t command, const std::vector<uint8_t>& payload) {
+  const size_t start = commandIndex(bus, command);
+  assert(levelAtByte(bus, start, kCs) == LOW);
+  size_t end = start + 1;
+  while (end < bus.bytes.size() && levelAtByte(bus, end, kDc) == HIGH) ++end;
+  assert(end - start - 1 == payload.size());
+  for (size_t index = 0; index < payload.size(); ++index) {
+    assert(bus.bytes[start + 1 + index] == payload[index]);
+    assert(levelAtByte(bus, start + 1 + index, kCs) == LOW);
+  }
+}
+
+uint32_t commandTime(const SPIClass& bus, uint8_t command) {
+  const size_t start = commandIndex(bus, command);
+  for (size_t index = 0; index < bus.transactionByteStarts.size(); ++index) {
+    if (bus.transactionByteStarts[index] == start) return bus.transactionTimes[index];
+  }
+  assert(false && "Expected initialization command to start its own transaction");
+  return 0;
+}
+
 }  // namespace
 
 static void configured_goouuu_pins_pass_the_project_guard_and_initialize_the_panel() {
@@ -75,6 +113,7 @@ static void configured_goouuu_pins_pass_the_project_guard_and_initialize_the_pan
   FaceDisplay display;
   const Ili9341::Pins pins = configuredWiring();
   assert(pins.sck == 3 && pins.backlight == -1);
+  assert(VOICEBOT_DISPLAY_SPI_HZ == 10000000);
   assert(voicebot_hardware::kMicrophoneBclk == 42);
   // GPIO3 used to be the microphone clock. Reserving it after the I2S move
   // disabled the display before SPI initialization, leaving a white screen.
@@ -157,6 +196,53 @@ static void bad_wiring_is_refused_and_leaves_the_bus_alone() {
   assert(bus.depth == 0);
 }
 
+static void zero_frequency_is_rejected_before_touching_hardware() {
+  arduino_stub::clear();
+  SPIClass bus(HSPI);
+  Ili9341 panel;
+  assert(!panel.begin(wiring(), 1, 0, bus));
+  assert(!panel.running() && bus.beginCalls == 0 && bus.bytes.empty());
+  assert(arduino_stub::modes.empty() && arduino_stub::writes.empty());
+}
+
+static void initialization_is_slow_complete_and_settled_before_fast_pixels() {
+  const uint32_t requests[] = {500000, 1000000, 10000000, 40000000};
+  for (uint32_t frequency : requests) {
+    arduino_stub::clear();
+    SPIClass bus(HSPI);
+    Ili9341 panel;
+    assert(panel.begin(wiring(), 1, frequency, bus));
+    assert(bus.bytes.front() == 0x01);  // Software reset follows the hardware pulse too.
+    assert(commandTime(bus, 0xEF) - commandTime(bus, 0x01) >= 150);
+    assert(commandTime(bus, 0x29) - commandTime(bus, 0x11) >= 150);
+    assert(arduino_stub::delayed - commandTime(bus, 0x29) >= 150);
+    expectCommand(bus, 0x01, {});
+    expectCommand(bus, 0xEF, {0x03, 0x80, 0x02});
+    expectCommand(bus, 0xEA, {0x00, 0x00});
+    expectCommand(bus, 0xCB, {0x39, 0x2C, 0x00, 0x34, 0x02});
+    expectCommand(bus, 0x3A, {0x55});
+    expectCommand(bus, 0x36, {0x28});
+    expectCommand(bus, 0x11, {});
+    expectCommand(bus, 0x29, {});
+    const uint32_t expectedInitFrequency = frequency < 1000000 ? frequency : 1000000;
+    for (const auto& settings : bus.transactionSettings) {
+      assert(settings.frequency == expectedInitFrequency);
+      assert(settings.order == MSBFIRST && settings.mode == SPI_MODE0);
+    }
+    // All commands/parameters use selected CS; command detection above also
+    // distinguishes literal parameter bytes from actual command boundaries.
+    for (size_t index = 0; index < bus.bytes.size(); ++index) {
+      assert(levelAtByte(bus, index, kCs) == LOW);
+    }
+    const size_t before = bus.transactionSettings.size();
+    panel.fill(0, 0, 1, 1, 0xF800);
+    assert(bus.transactionSettings.size() == before + 1);
+    assert(bus.transactionSettings.back().frequency == frequency);
+    assert(bus.transactionTimes.back() - commandTime(bus, 0x29) >= 150);
+    panel.end();
+  }
+}
+
 static void duplicate_and_invalid_output_pins_are_rejected_before_touching_hardware() {
   for (unsigned scenario = 0; scenario < 7; ++scenario) {
     arduino_stub::clear();
@@ -230,12 +316,22 @@ static void begin_resets_the_panel_and_holds_the_backlight_dark() {
   assert(bus.started && bus.sck == kSck && bus.mosi == kMosi);
   // A hardware reset pulse, low then high, before any command.
   bool low = false, pulsed = false;
-  for (size_t i = 0; i < arduino_stub::writes.size(); ++i) {
+  uint32_t resetLowAt = 0, resetHighAt = 0;
+  for (size_t i = 0; i < bus.byteMarks.front(); ++i) {
     if (arduino_stub::writes[i].pin != kReset) continue;
-    if (arduino_stub::writes[i].value == LOW) low = true;
-    else if (low) pulsed = true;
+    if (arduino_stub::writes[i].value == LOW) {
+      low = true;
+      resetLowAt = arduino_stub::writes[i].atMillis;
+    } else if (low) {
+      pulsed = true;
+      resetHighAt = arduino_stub::writes[i].atMillis;
+    }
   }
   assert(pulsed);
+  assert(resetHighAt - resetLowAt >= 20);
+  assert(bus.bytes.front() == 0x01);
+  assert(commandTime(bus, 0x01) - resetHighAt >= 150);
+  assert(bus.transactionTimes[1] - bus.transactionTimes[0] >= 150);
   assert(arduino_stub::delayed >= 150);
   // Nothing is shown until a complete face has been drawn.
   assert(arduino_stub::levelOf(kBacklight) == LOW);
@@ -285,6 +381,11 @@ static void a_window_write_sends_exact_bounds_and_big_endian_pixels() {
                                       0x00, 0x00, 0xFF, 0xFF, 0xF8, 0x00, 0x00, 0x1F,
                                       0x00, 0x00, 0xFF, 0xFF, 0xF8, 0x00, 0x00, 0x1F};
   assert(bus.bytes == expected);
+  for (size_t index = 0; index < expected.size(); ++index) {
+    assert(levelAtByte(bus, index, kCs) == LOW);
+    const bool isCommand = index == 0 || index == 5 || index == 10;
+    assert(levelAtByte(bus, index, kDc) == (isCommand ? LOW : HIGH));
+  }
   // One region costs exactly one transaction and one chip-select assertion.
   assert(bus.transactions == transactionsBefore + 1);
   assert(arduino_stub::levelOf(kCs) == HIGH);
@@ -323,12 +424,8 @@ static void fill_covers_every_pixel_of_the_rectangle() {
   bus.bytes.clear();
   panel.fill(0, 0, 320, 240, 0xFFFF);
   // Address bytes plus 320 * 240 pixels of two bytes each.
-  assert(bus.bytes.size() >= 320u * 240u * 2u);
-  size_t white = 0;
-  for (size_t i = 0; i + 1 < bus.bytes.size(); i += 2) {
-    if (bus.bytes[i] == 0xFF && bus.bytes[i + 1] == 0xFF) ++white;
-  }
-  assert(white >= 320u * 240u - 8u);
+  assert(bus.bytes.size() == 11u + 320u * 240u * 2u);
+  for (size_t i = 11; i < bus.bytes.size(); ++i) assert(bus.bytes[i] == 0xFF);
   // A zero or negative rectangle is a no-op rather than a runaway window.
   bus.bytes.clear();
   panel.fill(0, 0, 0, 10, 0);
@@ -441,6 +538,8 @@ int main() {
   every_active_audio_button_and_status_pin_is_rejected_before_hardware_use();
   admission_honours_disabled_optional_pins_and_custom_controls();
   bad_wiring_is_refused_and_leaves_the_bus_alone();
+  zero_frequency_is_rejected_before_touching_hardware();
+  initialization_is_slow_complete_and_settled_before_fast_pixels();
   duplicate_and_invalid_output_pins_are_rejected_before_touching_hardware();
   failed_bus_start_is_cleaned_up_and_can_be_retried();
   absent_reset_pin_uses_software_reset_and_waits_before_configuration();

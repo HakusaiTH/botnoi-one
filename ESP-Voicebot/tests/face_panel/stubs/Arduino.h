@@ -12,6 +12,7 @@ namespace arduino_stub {
 struct PinEvent {
   int pin;
   int value;
+  uint32_t atMillis;
 };
 extern std::vector<int> modes;
 extern std::vector<PinEvent> writes;

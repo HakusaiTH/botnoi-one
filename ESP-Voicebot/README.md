@@ -6,7 +6,7 @@ The supported target is **ESP32-S3**. Smart-speaker voice barge-in uses Espressi
 
 ## Hardware
 
-The current wiring follows [hardware_pinout.md](hardware_pinout.md) for the GOOUUU ESP32-S3-CAM V1.5. Audio pins are shared between the I2S driver and display conflict checks through `hardware_pins.h`.
+The current wiring follows [hardware_pinout.md](hardware_pinout.md) for the GOOUUU ESP32-S3-CAM V1.5. Its TFT signal map matches the [GOOUUU expansion-board reference](https://github.com/profharris/GOOUUU-Tech-ESP32-S3-CAM-Expansion-Board#lcd-28in-240320-spi-tft-display-ili9341). Audio pins are shared between the I2S driver and display conflict checks through `hardware_pins.h`.
 
 | Device | Signal | ESP32-S3 GPIO |
 | --- | --- | ---: |
@@ -28,13 +28,13 @@ The current wiring follows [hardware_pinout.md](hardware_pinout.md) for the GOOU
 
 Tie INMP441 L/R to GND for the left slot. Use a common ground and suitable power supply for the amplifier. The LED code expects an ordinary external LED, not an addressable RGB LED.
 
-The panel's MISO (GPIO46) and touch pins are optional/unconnected for display driving; the firmware never reads the controller and does not use the touch function. Every display pin is configurable in `config.local.h`, and `VOICEBOT_DISPLAY_ENABLED 0` builds audio-only firmware.
+The panel's MISO (GPIO46) and touch pins are not needed for display driving; the firmware never reads the controller and does not support touch with this audio wiring. The expansion board may still connect these signals physically. Every display pin is configurable in `config.local.h`, and `VOICEBOT_DISPLAY_ENABLED 0` builds audio-only firmware.
 
 **GPIO45 is a strapping pin** (VDD_SPI voltage select) sampled at reset; it is an ordinary output afterwards, but do not add an external pull resistor to it. If your panel's RESET is tied to the board's reset line, set `VOICEBOT_DISPLAY_RESET_PIN -1`.
 
 **The backlight is connected to 3.3V** (`VOICEBOT_DISPLAY_BACKLIGHT_PIN -1`). The face comes up already lit. If driving backlight via GPIO, ensure the module does not exceed the pin's rated continuous current. [Espressif ESP32-S3 pin documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
 
-GPIO4 is configured for the session talk-button (`VOICEBOT_BUTTON_PIN 4`).
+GPIO4 is the **external** session button (`VOICEBOT_BUTTON_PIN 4`); the expansion board's built-in KEY/BOOT button uses GPIO0. GPIO4 also connects to camera SCCB/SIOD, so the camera remains unused. Open expansion jumpers **P7/P8** for microphone operation, and do not use the OLED/SD peripherals that share audio pins. See the [shared-peripheral checklist](hardware_pinout.md#5-expansion-board-peripherals-sharing-these-pins), including the unused touch connections.
 
 ## Build and run
 
@@ -70,9 +70,13 @@ Rendering runs in its own priority-1 task, below the priority-2 audio tasks, on 
 
 Display bring-up happens **after audio/AEC and Wi-Fi initialization**. Its SPI state and 4 KiB task stack require heap, so the firmware checks the audio/TLS reserve before allocating them and again before allowing the render task to run. A startup audio failure is reported over serial before a display is started. With the documented backlight connected to 3.3 V, the panel stays lit even when initialization is skipped; GPIO-controlled backlights instead stay off until a complete face is drawn. Every 30 seconds `[FACE]` reports the current mood, both envelope levels and the render task's minimum unused stack.
 
-If upgrading from the old pin map, update any display/button overrides in `config.local.h` as shown in [hardware_pinout.md](hardware_pinout.md). Existing local definitions take precedence over updated defaults. The startup conflict log now includes the exact GPIO.
+The driver initializes at **1 MHz** and writes pixels at **10 MHz** by default. The ILI9341 specifies a minimum 100 ns serial write-clock period, equivalent to 10 MHz; 40 MHz exceeds that published timing. [ILI9341 datasheet, section 18.3.4](https://www.displayfuture.com/Display/datasheet/controller/ILI9341.pdf#page=238).
 
-This is a write-only SPI connection: a successful `[FACE] ILI9341 ...` log confirms initialization was sent, but cannot detect an unplugged panel. If the screen stays blank, check its supply, backlight, reset and pin wiring. The driver sends a complete five-byte power-control command and uses a software reset when no reset GPIO is configured, following the controller sequence in [Adafruit's ILI9341 driver](https://github.com/adafruit/Adafruit_ILI9341/blob/master/Adafruit_ILI9341.cpp).
+If upgrading, update the display/button overrides in `config.local.h` as shown in [hardware_pinout.md](hardware_pinout.md#6-updating-an-existing-local-configuration), including **`VOICEBOT_DISPLAY_SPI_HZ 10000000`**. Existing local definitions take precedence over updated defaults. Expect `[FACE] ILI9341 320x240 at 10MHz; ...`; a conflict log includes the exact GPIO.
+
+This is a write-only SPI connection: a successful `[FACE] ILI9341 ...` log confirms initialization was sent, but cannot detect an unplugged panel. A photo of snowy pixels alone cannot distinguish timing, wiring, reset, supply or controller problems. The extended register setup follows [Adafruit's ILI9341 driver](https://github.com/adafruit/Adafruit_ILI9341/blob/master/Adafruit_ILI9341.cpp). The firmware also performs a software reset even when a reset GPIO is configured. These changes need confirmation on the physical panel.
+
+For a blank or noisy screen, run `python3 ESP-Voicebot/scripts/display_check.py --frequency 1000000` from the repository root. It builds an isolated 1 MHz pattern sketch without audio, Wi-Fi or credentials and prints its path; upload it using the [display-test instructions](tests/display_target/README.md). Check that test before returning to the integrated voicebot.
 
 Application keepalives run every 20 seconds. A genuine network/upstream failure retries while Start remains active, with delays increasing from 1 to 30 seconds and small jitter. Recovery is explicitly logged as a **new server session**; the API does not document restoring conversation context after transport loss. Stop cancels recovery. Server completion, authorization rejection and invalid protocol messages end the call. A 60-second lack of incoming progress detects a stalled connection; deliberate speaker backpressure and ongoing inbound audio do not trigger that deadline.
 

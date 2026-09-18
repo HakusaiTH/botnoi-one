@@ -30,7 +30,8 @@
 #define BOTNOI_WS_PORT 443
 #endif
 
-// GPIO4 is the talk button pin for GOOUUU ESP32-S3-CAM.
+// External session button to GND. The expansion board's KEY/BOOT is GPIO0;
+// GPIO4 is also camera SCCB data, so do not use that camera with this button.
 #ifndef VOICEBOT_BUTTON_PIN
 #define VOICEBOT_BUTTON_PIN 4
 #endif
@@ -93,10 +94,11 @@
 #define VOICEBOT_DISPLAY_SPI_BUS HSPI
 #endif
 
-// 40 MHz is the reviewed default for this write-only panel and GPIO wiring.
-// Lower it for long wires or unstable pixels; validate changes on the hardware.
+// Conservative write clock: ILI9341 specifies a minimum 100 ns write cycle.
+// Initialization is capped at 1 MHz. Faster writes need board validation;
+// try 1 MHz first if jumper-wire connections show noise or missing pixels.
 #ifndef VOICEBOT_DISPLAY_SPI_HZ
-#define VOICEBOT_DISPLAY_SPI_HZ 40000000
+#define VOICEBOT_DISPLAY_SPI_HZ 10000000
 #endif
 
 // Frame interval of the face task. 33ms is about 30 frames per second, which

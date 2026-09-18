@@ -30,7 +30,7 @@ void pinMode(int pin, int mode) {
 }
 
 void digitalWrite(int pin, int value) {
-  arduino_stub::PinEvent event = {pin, value};
+  arduino_stub::PinEvent event = {pin, value, arduino_stub::delayed};
   arduino_stub::writes.push_back(event);
   arduino_stub::levels[pin] = value;
 }
@@ -55,9 +55,10 @@ void SPIClass::end() {
 }
 
 void SPIClass::beginTransaction(SPISettings settings) {
-  (void)settings;
   assert(started);
   transactionTimes.push_back(arduino_stub::delayed);
+  transactionByteStarts.push_back(bytes.size());
+  transactionSettings.push_back(settings);
   ++transactions;
   ++depth;
   assert(depth == 1);  // Nested transactions would deadlock on hardware.
@@ -70,6 +71,8 @@ void SPIClass::endTransaction() {
 
 void SPIClass::write(uint8_t value) {
   assert(depth == 1);  // Never send outside a transaction.
+  byteMarks.resize(bytes.size());  // Tests can clear the byte recording between frames.
+  byteMarks.push_back(arduino_stub::writes.size());
   bytes.push_back(value);
 }
 
@@ -84,5 +87,9 @@ void SPIClass::writeBytes(const uint8_t* data, size_t length) {
     volatile uint32_t consumed = word;
     (void)consumed;
   }
-  for (size_t i = 0; i < length; ++i) bytes.push_back(data[i]);
+  byteMarks.resize(bytes.size());
+  for (size_t i = 0; i < length; ++i) {
+    byteMarks.push_back(arduino_stub::writes.size());
+    bytes.push_back(data[i]);
+  }
 }

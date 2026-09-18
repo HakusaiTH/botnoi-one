@@ -32,10 +32,13 @@ class Ili9341 {
 
   bool begin(const Pins& pins, uint8_t rotation, uint32_t frequency, SPIClass& bus) {
     end();  // Reinitialization is supported only from the same owning task.
-    if (!validPins(pins)) return false;
+    if (!frequency || !validPins(pins)) return false;
     pins_ = pins;
     bus_ = &bus;
-    settings_ = SPISettings(frequency, MSBFIRST, SPI_MODE0);
+    // Bring the controller up at a conservative clock even when the caller
+    // opts into faster pixel writes. A lost COLMOD/MADCTL byte corrupts every
+    // later frame; this setup runs only once, outside the animation loop.
+    settings_ = SPISettings(frequency < 1000000 ? frequency : 1000000, MSBFIRST, SPI_MODE0);
     pinMode(pins_.dc, OUTPUT);
     pinMode(pins_.cs, OUTPUT);
     digitalWrite(pins_.dc, HIGH);
@@ -59,12 +62,13 @@ class Ili9341 {
       bus_ = nullptr;
       return false;
     }
-    if (pins_.reset < 0) {
-      send(0x01, nullptr, 0);  // SWRESET, including MCU-only restarts.
-      delay(150);
-    }
+    // Also reset over SPI when RESET is configured: the module can remain
+    // powered across MCU-only restarts, and its reset wire may be absent.
+    send(0x01, nullptr, 0);  // SWRESET
+    delay(150);
     sendInitSequence();
     setRotation(rotation);
+    settings_ = SPISettings(frequency, MSBFIRST, SPI_MODE0);
     running_ = true;
     return true;
   }
@@ -193,8 +197,10 @@ class Ili9341 {
     static const uint8_t kGammaNegative[15] = {0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1,
                                                0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36, 0x0F};
     static const uint8_t kPowerA[5] = {0x39, 0x2C, 0x00, 0x34, 0x02};
+    static const uint8_t kExtendedSetup[3] = {0x03, 0x80, 0x02};
     static const uint8_t kPowerB[3] = {0x00, 0xC1, 0x30};
     static const uint8_t kDriverTiming[3] = {0x85, 0x00, 0x78};
+    static const uint8_t kDriverTimingB[2] = {0x00, 0x00};
     static const uint8_t kPowerSequence[4] = {0x64, 0x03, 0x12, 0x81};
     static const uint8_t kPumpRatio[1] = {0x20};
     static const uint8_t kVcom1[2] = {0x3E, 0x28};
@@ -202,11 +208,15 @@ class Ili9341 {
     static const uint8_t kDisplayFunction[3] = {0x08, 0x82, 0x27};
     const uint8_t pixelFormat = 0x55;  // 16 bits per pixel.
     const uint8_t power1 = 0x23, power2 = 0x10, vcom2 = 0x86, gammaSet = 0x01, gamma3 = 0x00;
+    // Include the extended setup used by Adafruit_ILI9341, plus the driver
+    // timing B write also present in TFT_eSPI's ILI9341 initialization.
+    send(0xEF, kExtendedSetup, sizeof(kExtendedSetup));
     send(0xCF, kPowerB, 3);
     send(0xED, kPowerSequence, 4);
     send(0xE8, kDriverTiming, 3);
     send(0xCB, kPowerA, sizeof(kPowerA));
     send(0xF7, kPumpRatio, 1);
+    send(0xEA, kDriverTimingB, sizeof(kDriverTimingB));
     send(0xC0, &power1, 1);
     send(0xC1, &power2, 1);
     send(0xC5, kVcom1, 2);
@@ -221,7 +231,7 @@ class Ili9341 {
     send(0x11, nullptr, 0);  // SLPOUT
     delay(150);
     send(0x29, nullptr, 0);  // DISPON
-    delay(20);
+    delay(150);
   }
 
   Pins pins_ = {-1, -1, -1, -1, -1, -1};
