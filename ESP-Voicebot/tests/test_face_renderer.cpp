@@ -89,6 +89,62 @@ static void an_invalid_layout_is_rejected_instead_of_clipping() {
   Layout closed = Layout();
   closed.lidThickness = 200;  // A "closed" eye taller than an open one.
   assert(!FaceRenderer(closed, Palette()).valid());
+  for (int bad = 0; bad < 7; ++bad) {
+    Layout layout;
+    if (bad == 0) layout.gazeLimitX = -1;
+    if (bad == 1) layout.gazeLimitY = -1;
+    if (bad == 2) layout.mouthNarrowing = -1;
+    if (bad == 3) layout.lidThickness = 1;
+    if (bad == 4) layout.mouthMinDepth = -1;
+    if (bad == 5) layout.mouthRiseLimit = 0;
+    if (bad == 6) layout.eyeRadiusY = INT16_MAX;
+    FaceRenderer invalid(layout, Palette());
+    assert(!invalid.valid());
+    uint16_t untouched[FaceRenderer::kMaxRegionWidth];
+    for (auto& pixel : untouched) pixel = 0xDEAD;
+    invalid.renderRow(FaceRenderer::kLeftEye, FaceFrame{}, 0, untouched);
+    for (auto pixel : untouched) assert(pixel == 0xDEAD);
+  }
+}
+
+static void gaze_is_clamped_and_invalid_regions_do_not_alias_an_eye() {
+  FaceRenderer renderer;
+  FaceFrame extreme, bounded;
+  extreme.gazeX = INT8_MIN; extreme.gazeY = INT8_MAX;
+  bounded.gazeX = -renderer.layout().gazeLimitX;
+  bounded.gazeY = renderer.layout().gazeLimitY;
+  assert(!renderer.dirty(FaceRenderer::kLeftEye, extreme, bounded));
+  const Rect rect = renderer.region(FaceRenderer::kLeftEye);
+  uint16_t first[FaceRenderer::kMaxRegionWidth], second[FaceRenderer::kMaxRegionWidth];
+  for (int16_t row = 0; row < rect.h; ++row) {
+    renderer.renderRow(FaceRenderer::kLeftEye, extreme, row, first);
+    renderer.renderRow(FaceRenderer::kLeftEye, bounded, row, second);
+    for (int16_t column = 0; column < rect.w; ++column) assert(first[column] == second[column]);
+  }
+  for (auto& pixel : first) pixel = 0xDEAD;
+  for (uint8_t index : {uint8_t(3), uint8_t(255)}) {
+    assert(renderer.region(index).w == 0);
+    renderer.renderRow(index, FaceFrame{}, 40, first);
+    assert(!renderer.dirty(index, FaceFrame{}, FaceFrame{}));
+  }
+  for (auto pixel : first) assert(pixel == 0xDEAD);
+}
+
+static void large_valid_geometry_does_not_overflow_fixed_point_math() {
+  Layout layout;
+  layout.height = 12000; layout.eyeRadiusY = 3000;
+  layout.eyeCenterY = 4000; layout.mouthCenterY = 10000;
+  FaceRenderer renderer(layout, Palette());
+  assert(renderer.valid());
+  const Rect rect = renderer.region(FaceRenderer::kLeftEye);
+  uint16_t pixels[FaceRenderer::kMaxRegionWidth + 1];
+  for (auto& pixel : pixels) pixel = 0xDEAD;
+  // dyQ8*4096 exceeds int32 here, although the geometry itself is valid.
+  renderer.renderRow(FaceRenderer::kLeftEye, FaceFrame{}, 100, pixels);
+  bool drewEye = false;
+  for (int16_t i = 0; i < rect.w; ++i) drewEye = drewEye || pixels[i] != renderer.palette().background;
+  assert(drewEye);
+  for (size_t i = rect.w; i < sizeof(pixels) / sizeof(pixels[0]); ++i) assert(pixels[i] == 0xDEAD);
 }
 
 static void an_open_eye_is_solid_in_the_middle_and_clear_in_the_corners() {
@@ -210,6 +266,9 @@ static void dirty_tracks_exactly_the_fields_each_region_draws() {
   FaceFrame curved = base;
   curved.mouthCurve = -40;
   assert(renderer.dirty(FaceRenderer::kMouth, base, curved));
+  FaceFrame sameGeometry = base;
+  sameGeometry.mouthCurve = 125; // Same positive lip quantization as104.
+  assert(!renderer.dirty(FaceRenderer::kMouth, base, sameGeometry));
   for (uint8_t index = 0; index < FaceRenderer::kRegionCount; ++index) {
     assert(!renderer.dirty(index, base, base));
   }
@@ -232,6 +291,8 @@ static void blending_and_the_integer_square_root_stay_exact_at_the_ends() {
 int main() {
   the_default_layout_fits_the_panel_without_overlapping_regions();
   an_invalid_layout_is_rejected_instead_of_clipping();
+  gaze_is_clamped_and_invalid_regions_do_not_alias_an_eye();
+  large_valid_geometry_does_not_overflow_fixed_point_math();
   an_open_eye_is_solid_in_the_middle_and_clear_in_the_corners();
   eye_openness_scales_the_height_but_keeps_the_width();
   gaze_moves_the_eye_and_stays_inside_its_window();

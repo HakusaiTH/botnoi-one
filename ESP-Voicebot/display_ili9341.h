@@ -4,12 +4,16 @@
 #include <SPI.h>
 #include <stddef.h>
 #include <stdint.h>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <driver/gpio.h>
+#endif
 
 namespace voicebot_face {
 
 // Minimal ILI9341 driver: only a rectangle fill and repeated window writes from
 // a caller-owned row buffer, which is all the animated face needs. No fonts, no
-// glyph tables, no touch controller and no framebuffer, so it adds no heap.
+// glyph tables, no touch controller and no framebuffer. Pixel storage is fixed;
+// the underlying SPI core still allocates its own control state.
 // Pixels are byte-swapped here rather than relying on a core-specific
 // writePixels() byte order.
 class Ili9341 {
@@ -27,7 +31,8 @@ class Ili9341 {
   static const size_t kMaxSpanPixels = 320;
 
   bool begin(const Pins& pins, uint8_t rotation, uint32_t frequency, SPIClass& bus) {
-    if (pins.sck < 0 || pins.mosi < 0 || pins.dc < 0 || pins.cs < 0) return false;
+    end();  // Reinitialization is supported only from the same owning task.
+    if (!validPins(pins)) return false;
     pins_ = pins;
     bus_ = &bus;
     settings_ = SPISettings(frequency, MSBFIRST, SPI_MODE0);
@@ -46,9 +51,18 @@ class Ili9341 {
       digitalWrite(pins_.reset, LOW);
       delay(20);
       digitalWrite(pins_.reset, HIGH);
+      delay(150);
     }
-    delay(150);
-    bus_->begin(pins_.sck, -1, pins_.mosi, -1);
+    if (!bus_->begin(pins_.sck, -1, pins_.mosi, -1)) {
+      // SPIClass can retain a started bus after a pin-attachment failure.
+      bus_->end();
+      bus_ = nullptr;
+      return false;
+    }
+    if (pins_.reset < 0) {
+      send(0x01, nullptr, 0);  // SWRESET, including MCU-only restarts.
+      delay(150);
+    }
     sendInitSequence();
     setRotation(rotation);
     running_ = true;
@@ -61,6 +75,7 @@ class Ili9341 {
     backlight(false);
     send(0x28, nullptr, 0);  // DISPOFF
     bus_->end();
+    bus_ = nullptr;
   }
 
   bool running() const { return running_; }
@@ -106,11 +121,14 @@ class Ili9341 {
   }
 
   void writeRow(const uint16_t* pixels, size_t count) {
-    if (!running_ || !pixels) return;
+    if (!running_ || !pixels || !count) return;
     if (count > kMaxSpanPixels) count = kMaxSpanPixels;
     for (size_t i = 0; i < count; ++i) {
       swap_[i] = static_cast<uint16_t>((pixels[i] << 8) | (pixels[i] >> 8));
     }
+    // ESP32 SPI loads whole 32-bit words, even for an odd pixel count. The
+    // extra half-word remains inside this buffer and is never sent on the wire.
+    if (count & 1) swap_[count] = 0;
     bus_->writeBytes(reinterpret_cast<const uint8_t*>(swap_), count * 2);
   }
 
@@ -121,12 +139,33 @@ class Ili9341 {
   }
 
  private:
+  static bool validPins(const Pins& pins) {
+    const int8_t assigned[] = {pins.sck, pins.mosi, pins.dc, pins.cs, pins.reset, pins.backlight};
+    for (size_t index = 0; index < sizeof(assigned) / sizeof(assigned[0]); ++index) {
+      const int pin = assigned[index];
+      if (index >= 4 && pin == -1) continue;
+      if (pin < 0) return false;
+#if defined(ARDUINO_ARCH_ESP32)
+      // Bound the shift used by GPIO_IS_VALID_OUTPUT_GPIO as well as checking
+      // this chip's output-capable pin mask. Board-specific conflicts belong
+      // to the application, before it calls begin().
+      if (pin >= 64 || !GPIO_IS_VALID_OUTPUT_GPIO(pin)) return false;
+#endif
+      for (size_t previous = 0; previous < index; ++previous) {
+        if (assigned[previous] == pin) return false;
+      }
+    }
+    return true;
+  }
+
   // Writes one command plus its parameters. Chip select must already be held.
   void write(uint8_t command, const uint8_t* data, size_t length) {
     digitalWrite(pins_.dc, LOW);
     bus_->write(command);
     digitalWrite(pins_.dc, HIGH);
-    if (length && data) bus_->writeBytes(data, length);
+    // Parameters are at most 15 bytes and may have byte alignment. The ESP32
+    // bulk API performs rounded-up word loads, so use byte writes here.
+    if (data) for (size_t index = 0; index < length; ++index) bus_->write(data[index]);
   }
 
   void send(uint8_t command, const uint8_t* data, size_t length) {
@@ -153,7 +192,7 @@ class Ili9341 {
                                                0x37, 0x07, 0x10, 0x03, 0x0E, 0x09, 0x00};
     static const uint8_t kGammaNegative[15] = {0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1,
                                                0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36, 0x0F};
-    static const uint8_t kPowerA[3] = {0x39, 0x2C, 0x00};
+    static const uint8_t kPowerA[5] = {0x39, 0x2C, 0x00, 0x34, 0x02};
     static const uint8_t kPowerB[3] = {0x00, 0xC1, 0x30};
     static const uint8_t kDriverTiming[3] = {0x85, 0x00, 0x78};
     static const uint8_t kPowerSequence[4] = {0x64, 0x03, 0x12, 0x81};
@@ -166,7 +205,7 @@ class Ili9341 {
     send(0xCF, kPowerB, 3);
     send(0xED, kPowerSequence, 4);
     send(0xE8, kDriverTiming, 3);
-    send(0xCB, kPowerA, 3);
+    send(0xCB, kPowerA, sizeof(kPowerA));
     send(0xF7, kPumpRatio, 1);
     send(0xC0, &power1, 1);
     send(0xC1, &power2, 1);
@@ -188,7 +227,7 @@ class Ili9341 {
   Pins pins_ = {-1, -1, -1, -1, -1, -1};
   SPIClass* bus_ = nullptr;
   SPISettings settings_;
-  uint16_t swap_[kMaxSpanPixels];
+  alignas(4) uint16_t swap_[kMaxSpanPixels] = {};
   int16_t width_ = 320;
   int16_t height_ = 240;
   bool running_ = false;

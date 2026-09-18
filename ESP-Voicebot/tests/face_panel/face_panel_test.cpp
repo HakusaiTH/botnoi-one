@@ -62,6 +62,70 @@ static void bad_wiring_is_refused_and_leaves_the_bus_alone() {
   assert(bus.depth == 0);
 }
 
+static void duplicate_and_invalid_output_pins_are_rejected_before_touching_hardware() {
+  for (unsigned scenario = 0; scenario < 7; ++scenario) {
+    arduino_stub::clear();
+    SPIClass bus(HSPI);
+    Ili9341 panel;
+    Ili9341::Pins pins = wiring();
+    switch (scenario) {
+      case 0: pins.dc = pins.sck; break;
+      case 1: pins.reset = pins.backlight; break;
+      case 2: pins.backlight = pins.cs; break;
+      case 3: pins.reset = -2; break;
+      case 4: pins.dc = 22; break;  // Not a usable ESP32-S3 GPIO.
+      case 5: pins.mosi = 49; break;
+      case 6: pins.dc = 127; break;  // Must not cause an oversized GPIO-mask shift.
+    }
+    assert(!panel.begin(pins, 1, 40000000, bus));
+    assert(!panel.running() && bus.beginCalls == 0 && bus.endCalls == 0);
+    assert(arduino_stub::modes.empty() && arduino_stub::writes.empty());
+  }
+}
+
+static void failed_bus_start_is_cleaned_up_and_can_be_retried() {
+  arduino_stub::clear();
+  SPIClass bus(HSPI);
+  bus.beginSucceeds = false;
+  FaceDisplay display;
+  assert(!display.begin(wiring(), 1, 40000000, bus));
+  assert(!display.running() && !bus.started);
+  assert(bus.beginCalls == 1 && bus.endCalls == 1);
+  assert(bus.bytes.empty() && bus.transactions == 0);
+  assert(arduino_stub::levelOf(kBacklight) == LOW);
+  assert(arduino_stub::levelOf(kCs) == HIGH);
+  display.update(FaceFrame());
+  display.end();
+  assert(bus.bytes.empty() && bus.endCalls == 1);
+  bus.beginSucceeds = true;
+  assert(display.begin(wiring(), 1, 40000000, bus));
+  assert(display.running() && bus.beginCalls == 2);
+  display.end();
+  assert(bus.endCalls == 2);
+}
+
+static void absent_reset_pin_uses_software_reset_and_waits_before_configuration() {
+  arduino_stub::clear();
+  SPIClass bus(HSPI);
+  Ili9341 panel;
+  Ili9341::Pins pins = wiring();
+  pins.reset = -1;
+  pins.backlight = -1;
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    bus.bytes.clear();
+    bus.transactionTimes.clear();
+    assert(panel.begin(pins, 1, 40000000, bus));
+    assert(!bus.bytes.empty() && bus.bytes[0] == 0x01);
+    assert(bus.transactionTimes.size() >= 2);
+    assert(bus.transactionTimes[1] - bus.transactionTimes[0] >= 150);
+    panel.end();
+  }
+  for (size_t index = 0; index < arduino_stub::writes.size(); ++index) {
+    assert(arduino_stub::writes[index].pin >= 0);
+    assert(arduino_stub::writes[index].pin != kReset);
+  }
+}
+
 static void begin_resets_the_panel_and_holds_the_backlight_dark() {
   arduino_stub::clear();
   SPIClass bus(HSPI);
@@ -85,6 +149,8 @@ static void begin_resets_the_panel_and_holds_the_backlight_dark() {
   assert(sent(bus.bytes, std::vector<uint8_t>{0x3A, 0x55}));
   assert(sent(bus.bytes, std::vector<uint8_t>{0x11}));
   assert(sent(bus.bytes, std::vector<uint8_t>{0x29}));
+  // Power control A consumes all five parameters before the next command.
+  assert(sent(bus.bytes, std::vector<uint8_t>{0xCB, 0x39, 0x2C, 0x00, 0x34, 0x02, 0xF7}));
   panel.end();
   assert(!panel.running() && !bus.started);
   assert(arduino_stub::levelOf(kBacklight) == LOW);
@@ -127,6 +193,30 @@ static void a_window_write_sends_exact_bounds_and_big_endian_pixels() {
   // One region costs exactly one transaction and one chip-select assertion.
   assert(bus.transactions == transactionsBefore + 1);
   assert(arduino_stub::levelOf(kCs) == HIGH);
+  panel.end();
+}
+
+static void odd_and_maximum_rows_use_safe_bulk_storage_without_extra_wire_pixels() {
+  arduino_stub::clear();
+  SPIClass bus(HSPI);
+  Ili9341 panel;
+  assert(panel.begin(wiring(), 1, 40000000, bus));
+  uint16_t row[Ili9341::kMaxSpanPixels];
+  for (size_t index = 0; index < Ili9341::kMaxSpanPixels; ++index) {
+    row[index] = static_cast<uint16_t>(0x9000 + index);
+  }
+  const size_t counts[] = {1, 3, 319, 320};
+  for (size_t count : counts) {
+    bus.bytes.clear();
+    panel.beginWindow(0, 0, static_cast<int16_t>(count), 1);
+    panel.writeRow(row, count);
+    panel.endWindow();
+    assert(bus.bytes.size() == 11 + count * 2);
+    for (size_t index = 0; index < count; ++index) {
+      assert(bus.bytes[11 + index * 2] == static_cast<uint8_t>(row[index] >> 8));
+      assert(bus.bytes[12 + index * 2] == static_cast<uint8_t>(row[index]));
+    }
+  }
   panel.end();
 }
 
@@ -238,15 +328,33 @@ static void a_layout_the_renderer_rejects_never_opens_the_panel() {
   assert(!portrait.running());
 }
 
+static void invalid_reinitialization_closes_the_previous_display() {
+  arduino_stub::clear();
+  SPIClass bus(HSPI);
+  FaceDisplay display;
+  assert(display.begin(wiring(), 1, 40000000, bus));
+  display.update(FaceFrame());
+  Layout broken;
+  broken.mouthCenterY = 130;
+  assert(!display.begin(wiring(), 1, 40000000, bus, broken));
+  assert(!display.running() && !bus.started && bus.endCalls == 1);
+  assert(arduino_stub::levelOf(kBacklight) == LOW);
+}
+
 int main() {
   bad_wiring_is_refused_and_leaves_the_bus_alone();
+  duplicate_and_invalid_output_pins_are_rejected_before_touching_hardware();
+  failed_bus_start_is_cleaned_up_and_can_be_retried();
+  absent_reset_pin_uses_software_reset_and_waits_before_configuration();
   begin_resets_the_panel_and_holds_the_backlight_dark();
   rotation_selects_the_madctl_value_and_the_axis_order();
   a_window_write_sends_exact_bounds_and_big_endian_pixels();
+  odd_and_maximum_rows_use_safe_bulk_storage_without_extra_wire_pixels();
   fill_covers_every_pixel_of_the_rectangle();
   the_first_face_paints_everything_and_lights_the_backlight();
   only_changed_regions_reach_the_bus();
   a_layout_the_renderer_rejects_never_opens_the_panel();
+  invalid_reinitialization_closes_the_previous_display();
   printf("test_face_panel: all cases passed\n");
   return 0;
 }

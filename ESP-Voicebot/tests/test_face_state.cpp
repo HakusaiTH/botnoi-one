@@ -23,6 +23,8 @@ static void the_integer_sine_covers_a_full_cycle() {
   assert(voicebot_face::phaseOf(500, 1000) == 64);
   assert(voicebot_face::phaseOf(1000, 1000) == 0);
   assert(voicebot_face::phaseOf(10, 0) == 0);
+  assert(voicebot_face::phaseOf(43200000, 86400000) == 64);
+  assert(voicebot_face::phaseOf(UINT32_MAX - 1, UINT32_MAX) == 127);
 }
 
 static void boot_opens_the_lids_once_and_settles_into_a_smile() {

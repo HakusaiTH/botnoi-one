@@ -23,7 +23,7 @@ class SPISettings {
 class SPIClass {
  public:
   explicit SPIClass(uint8_t bus) : bus(bus) {}
-  void begin(int8_t sck, int8_t miso, int8_t mosi, int8_t ss);
+  bool begin(int8_t sck, int8_t miso, int8_t mosi, int8_t ss);
   void end();
   void beginTransaction(SPISettings settings);
   void endTransaction();
@@ -32,9 +32,13 @@ class SPIClass {
 
   uint8_t bus;
   bool started = false;
+  bool beginSucceeds = true;
+  uint32_t beginCalls = 0;
+  uint32_t endCalls = 0;
   int8_t sck = -1, miso = -1, mosi = -1, ss = -1;
   uint32_t transactions = 0;
   int32_t depth = 0;
   std::vector<uint8_t> bytes;        // Everything sent, in order.
   std::vector<size_t> byteMarks;     // Index in `bytes` of each byte's DC level.
+  std::vector<uint32_t> transactionTimes;
 };

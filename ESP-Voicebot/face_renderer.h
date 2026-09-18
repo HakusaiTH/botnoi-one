@@ -84,9 +84,13 @@ class FaceRenderer {
 
   bool valid() const {
     if (layout_.width <= 0 || layout_.height <= 0) return false;
+    if (layout_.eyeSpacing <= 0 || layout_.lidThickness < 2 ||
+        layout_.gazeLimitX < 0 || layout_.gazeLimitY < 0) return false;
     if (layout_.eyeRadiusX <= 0 || layout_.eyeRadiusY <= layout_.lidThickness / 2) return false;
-    if (layout_.mouthHalfWidth <= layout_.mouthNarrowing) return false;
-    if (layout_.mouthMaxDepth < layout_.mouthMinDepth) return false;
+    if (layout_.mouthNarrowing < 0 || layout_.mouthHalfWidth <= layout_.mouthNarrowing) return false;
+    // Either lip can reach four pixels for the full int8 curvature range.
+    if (layout_.mouthMinDepth < 0 || layout_.mouthRiseLimit < 4 ||
+        layout_.mouthMaxDepth < 4 || layout_.mouthMaxDepth < layout_.mouthMinDepth) return false;
     for (uint8_t index = 0; index < kRegionCount; ++index) {
       const Rect rect = region(index);
       if (rect.w <= 0 || rect.h <= 0 || rect.w > kMaxRegionWidth) return false;
@@ -99,36 +103,38 @@ class FaceRenderer {
   }
 
   Rect region(uint8_t index) const {
-    Rect rect;
+    if (index >= kRegionCount) return {0, 0, 0, 0};
     if (index == kMouth) {
-      rect.x = static_cast<int16_t>(layout_.width / 2 - layout_.mouthHalfWidth - 1);
-      rect.w = static_cast<int16_t>(2 * layout_.mouthHalfWidth + 3);
-      rect.y = static_cast<int16_t>(layout_.mouthCenterY - layout_.mouthRiseLimit - 1);
-      rect.h = static_cast<int16_t>(layout_.mouthRiseLimit + layout_.mouthMaxDepth + 3);
-    } else {
-      const int16_t reachX = static_cast<int16_t>(layout_.gazeLimitX + layout_.eyeRadiusX);
-      const int16_t reachY = static_cast<int16_t>(layout_.gazeLimitY + layout_.eyeRadiusY);
-      rect.x = static_cast<int16_t>(eyeCenterX(index) - reachX - 1);
-      rect.w = static_cast<int16_t>(2 * reachX + 3);
-      rect.y = static_cast<int16_t>(layout_.eyeCenterY - reachY - 1);
-      rect.h = static_cast<int16_t>(2 * reachY + 3);
+      return boundedRect(layout_.width / 2 - layout_.mouthHalfWidth - 1,
+          layout_.mouthCenterY - layout_.mouthRiseLimit - 1,
+          2 * static_cast<int32_t>(layout_.mouthHalfWidth) + 3,
+          static_cast<int32_t>(layout_.mouthRiseLimit) + layout_.mouthMaxDepth + 3);
     }
-    return rect;
+    const int32_t reachX = static_cast<int32_t>(layout_.gazeLimitX) + layout_.eyeRadiusX;
+    const int32_t reachY = static_cast<int32_t>(layout_.gazeLimitY) + layout_.eyeRadiusY;
+    return boundedRect(eyeCenterX(index) - reachX - 1, layout_.eyeCenterY - reachY - 1,
+                       2 * reachX + 3, 2 * reachY + 3);
   }
 
   // True when this region's pixels differ between two frames. Skipping a clean
   // region is what keeps a talking mouth from redrawing both eyes every frame.
   bool dirty(uint8_t index, const FaceFrame& previous, const FaceFrame& next) const {
+    if (index >= kRegionCount || !valid()) return false;
     if (index == kMouth) {
-      return previous.mouthOpen != next.mouthOpen || previous.mouthCurve != next.mouthCurve;
+      int32_t x, y, beforeX, beforeUp, beforeDown, afterX, afterUp, afterDown;
+      mouthShape(previous, x, y, beforeX, beforeUp, beforeDown);
+      mouthShape(next, x, y, afterX, afterUp, afterDown);
+      return beforeX != afterX || beforeUp != afterUp || beforeDown != afterDown;
     }
     const uint8_t before = index == kLeftEye ? previous.leftEyeOpen : previous.rightEyeOpen;
     const uint8_t after = index == kLeftEye ? next.leftEyeOpen : next.rightEyeOpen;
-    return before != after || previous.gazeX != next.gazeX || previous.gazeY != next.gazeY;
+    return before != after || clampGaze(previous.gazeX, layout_.gazeLimitX) != clampGaze(next.gazeX, layout_.gazeLimitX) ||
+           clampGaze(previous.gazeY, layout_.gazeLimitY) != clampGaze(next.gazeY, layout_.gazeLimitY);
   }
 
   // Writes region(index).w pixels. `row` is relative to the region's top.
   void renderRow(uint8_t index, const FaceFrame& frame, int16_t row, uint16_t* pixels) const {
+    if (index >= kRegionCount || !valid()) return;
     const Rect rect = region(index);
     if (!pixels || rect.w <= 0 || rect.w > kMaxRegionWidth) return;
     for (int16_t i = 0; i < rect.w; ++i) pixels[i] = palette_.background;
@@ -174,6 +180,17 @@ class FaceRenderer {
   }
 
  private:
+  static Rect boundedRect(int32_t x, int32_t y, int32_t width, int32_t height) {
+    if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        x > INT16_MAX || y > INT16_MAX || width > INT16_MAX || height > INT16_MAX) return {0, 0, 0, 0};
+    return {static_cast<int16_t>(x), static_cast<int16_t>(y),
+            static_cast<int16_t>(width), static_cast<int16_t>(height)};
+  }
+
+  static int16_t clampGaze(int8_t value, int16_t limit) {
+    return value < -limit ? -limit : value > limit ? limit : value;
+  }
+
   static bool overlaps(const Rect& a, const Rect& b) {
     return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
   }
@@ -183,7 +200,7 @@ class FaceRenderer {
     if (radiusXQ8 <= 0 || radiusYQ8 <= 0) return 0;
     if (dyQ8 < 0) dyQ8 = -dyQ8;
     if (dyQ8 >= radiusYQ8) return 0;
-    const int32_t ratio = static_cast<int32_t>(dyQ8 * 4096 / radiusYQ8);        // Q12
+    const int32_t ratio = static_cast<int32_t>(static_cast<int64_t>(dyQ8) * 4096 / radiusYQ8);  // Q12
     const int32_t remaining = 4096 - ((ratio * ratio) >> 12);                   // Q12
     if (remaining <= 0) return 0;
     const int32_t root =
@@ -209,8 +226,8 @@ class FaceRenderer {
   void eyeShape(uint8_t index, const FaceFrame& frame, int32_t& centreXQ8, int32_t& centreYQ8,
                 int32_t& radiusXQ8, int32_t& radiusYQ8) const {
     const uint8_t open = index == kLeftEye ? frame.leftEyeOpen : frame.rightEyeOpen;
-    centreXQ8 = (static_cast<int32_t>(eyeCenterX(index)) + frame.gazeX) * 256;
-    centreYQ8 = (static_cast<int32_t>(layout_.eyeCenterY) + frame.gazeY) * 256;
+    centreXQ8 = (static_cast<int32_t>(eyeCenterX(index)) + clampGaze(frame.gazeX, layout_.gazeLimitX)) * 256;
+    centreYQ8 = (static_cast<int32_t>(layout_.eyeCenterY) + clampGaze(frame.gazeY, layout_.gazeLimitY)) * 256;
     radiusXQ8 = static_cast<int32_t>(layout_.eyeRadiusX) * 256;
     // A closed eye keeps its full width, so it reads as a lowered lid rather
     // than as a disappearing eye.

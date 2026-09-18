@@ -46,7 +46,7 @@ inline int16_t sine(uint8_t phase) {
 // Phase of a periodic motion, as a 128-step value suitable for sine().
 inline uint8_t phaseOf(uint32_t elapsedMs, uint32_t periodMs) {
   if (!periodMs) return 0;
-  return static_cast<uint8_t>((elapsedMs % periodMs) * 128u / periodMs) & 0x7F;
+  return static_cast<uint8_t>(static_cast<uint64_t>(elapsedMs % periodMs) * 128u / periodMs) & 0x7F;
 }
 
 // Turns a mood plus two audio envelopes into a FaceFrame. Pure apart from its

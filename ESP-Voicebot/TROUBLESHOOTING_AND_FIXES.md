@@ -22,6 +22,10 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 | Stop/Start race while TLS is busy | Finite command queue and competing writes to the requested state | Versioned atomic intent preserves the newest press and invalidates old connection callbacks. Stop cancels queued audio immediately; rapid Stop/Start closes the old call before starting another. |
 | Resource retention or silent connection stall | A socket can stop making progress without an immediate disconnect callback | Cleanup clears recording, partial PCM and queued playback. Keepalives and a traffic-aware deadline detect stalls. Network/upstream errors retry with bounded backoff while Start remains active, explicitly logging a new server session. |
 | Unsafe partial startup | Queue, I2S or task failure could still allow normal loop execution | Networking remains disabled after startup failure, and initialized audio resources are released. Task creation is checked. |
+| Display reports success when SPI setup failed | The SPI return value was ignored and the host stub could not fail | Bus/pin initialization failure is propagated and cleaned up. Duplicate/invalid display pins and conflicts with audio/button/status LED pins are refused. |
+| Blank or unreliable panel after restart | Truncated power-control parameters and no software reset when RESET is not wired | The full five-byte `0xCB` command is sent; no-reset-pin configurations receive `SWRESET` with its settling delay. A write-only panel still cannot report physical presence. |
+| Display reduces the audio startup reserve | The render task and SPI mutexes were allocated before AEC despite a no-heap claim | Audio/AEC and Wi-Fi initialize first; optional display allocation is admitted only with remaining TLS headroom. Failure leaves the audio pipeline active. |
+| Mouth moves before sound or changes speed under task jitter | Its envelope sampled staging submissions and rounded smoothing on every poll | The capture task follows actual played DMA reference samples. Fixed-point smoothing preserves sub-level progress across different update cadences. |
 | CPU/network starvation | Large frame reads, high-priority tasks, and blocking/bursty sends | Incremental receive work, one paced microphone packet per interval, bounded DMA callbacks and priority-2 audio tasks with queue waits and explicit capture yield. |
 | Unused RAM/CPU work | Local VAD was calculated continuously but never controlled transmission | Unused detector instance and processing removed. The Botnoi server still provides VAD. Vendored VAD source remains available for future use. |
 
@@ -51,14 +55,30 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 - `Invalid JSON ... memory limit`: malformed, overly nested or overly complex control message; wire text is limited to 8 KiB and the JSON arena to 12 KiB. Increase a limit only after examining the actual message and RAM budget.
 - `No inbound progress ...`: keepalive/transport progress has stalled for 60 seconds. Incoming audio, partial frame progress and deliberate receive backpressure keep a healthy busy connection alive.
 - `Unsupported session audio format`: the server did not advertise unpaused audio/L16, 16 kHz, one channel as documented. Do not play another format as PCM16.
-- `[FACE] Display unavailable ...`: the configured pins are incomplete or the face layout does not fit the selected rotation. The voicebot continues without the panel; audio is never blocked on the display.
+- `[FACE] Display unavailable ...` / `Display skipped ...`: invalid/conflicting pins, SPI startup failure, incompatible layout or insufficient heap reserve. The voicebot continues without the panel. A successful initialization log is not evidence that an unplugged panel was detected; this SPI connection has no readback.
 - `[FACE] mood=...`: mood values follow `voicebot_face::Mood` (0 boot, 1 connecting, 2 idle, 3 listening, 4 speaking-wait/thinking, 5 speaking, 6 error). A mood stuck at 6 means a latched audio fault, not a display problem. Both levels are 0..255 envelope outputs; a speaker level that never leaves 0 during a reply points at the playback path rather than the panel.
 
 ## Validation scope
 
 The repository includes reproducible Arduino builds for PSRAM enabled/disabled, sanitizer-backed host tests and a standalone actual ESP-SR DSP fixture. The current changes have not been flashed to a connected ESP32 in this session. The ILI9341 face has **not** run on a physical panel: its host suites cover the animation, the rasterized pixels, the command stream and the byte order, but rotation, colour order, backlight wiring, SPI timing margin and the visual result are unmeasured. Hardware audio quality, runtime TLS peaks, power stability, echo behavior and long-session context remain to be measured on the actual device. The supplied log shows application-triggered session reconnections with available internal RAM; it does not contain a boot banner, panic or reset cause establishing an ESP32 reboot.
 
-### Results recorded on 2026-09-18
+### Display integration validated on 2026-09-18
+
+Reused the existing Arduino CLI 1.5.1, ESP32 core 3.3.11 and ArduinoJson 7.4.3 installation. A second core download was unnecessary. All **15 host suites**, including `tests/client`, passed with AddressSanitizer and UndefinedBehaviorSanitizer. Added checks cover failed/partial SPI initialization, command lengths, software reset, native-style aligned word reads, invalid pins, envelope cadence/hold expiry, renderer bounds and equivalent-shape redraw suppression. Six states rendered with the actual face helpers were visually inspected for clipping; this is a software preview, not a panel test.
+
+All final builds passed without compiler warnings using dummy credentials:
+
+| Build (AEC enabled) | Flash bytes | Static internal RAM bytes | RAM after globals |
+| --- | ---: | ---: | ---: |
+| Display enabled, OPI PSRAM | 1,191,099 | 83,316 | 244,364 |
+| Display enabled, PSRAM disabled | 1,185,893 | 82,864 | 244,816 |
+| Display disabled, OPI PSRAM | 1,179,435 | 82,268 | 245,412 |
+
+Within this revision the display adds 1,048 bytes of static RAM, plus its 4,096-byte task stack, task control block and SPI objects/mutexes at runtime. The firmware initializes it after audio/AEC and Wi-Fi and checks the remaining TLS reserve. No framebuffer or per-frame allocation is used. Heap peaks and scheduling under simultaneous audio/display activity still require a board.
+
+Logs and source manifests: `build/compile-upk9m2i9/` (display enabled, both PSRAM profiles) and `build/compile-kwdvbilg/` (display disabled). `scripts/compile.py --display off` now makes audio-only validation reproducible. The original display commit `0f8045f` also compiled successfully with the reused toolchain; artifact `build/compile-_2_z1vr_/` records that baseline.
+
+### AEC baseline recorded on 2026-09-18 (`bc38c2e`)
 
 Toolchain: Arduino CLI 1.5.1, Espressif Arduino core 3.3.11 (bundled ESP-SR 2.4.6), ArduinoJson 7.4.3. Board: `esp32:esp32:esp32s3`, 16 MB flash, `app3M_fat9M_16MB`, USB CDC disabled. All three builds passed without compiler warnings using dummy credentials.
 
@@ -72,7 +92,7 @@ The additional static RAM holds bounded microphone/reference history and packeti
 
 All **11 host suites** passed AddressSanitizer and UndefinedBehaviorSanitizer. New coverage includes exact post-gain DMA references and cancellation tails, stale generations, staggered first callbacks, reordered/coalesced callbacks, ring overflow and timer rollover; continuous AEC frame history and 512-to-320 sample conversion; and speaker packetization across every chunk size from 1 to 320 samples. The pacing regression sends all 499 eligible packets under healthy modeled DSP timings from 6 to 25 ms with a 5 ms transport write; congestion still rejects stale audio. AEC wrapper doubles exercise admission, partial-init cleanup, alignment and resource lifetime.
 
-Source-hash manifests and logs are in ignored artifacts `build/compile-ddtkov57/` (default matrix) and `build/compile-udm8xbcp/` (AEC disabled). These firmware sources match the current revision, apart from substituted test credentials. The real target missing-PSRAM branch passed on pinned Espressif QEMU 9.2.2 (`esp_develop_9.2.2_20260417`), artifact `build/aec-target-abrdofw6/`; it returned the fallback status without allocating native DSP.
+Source-hash manifests and logs are in ignored artifacts `build/compile-ddtkov57/` (default matrix) and `build/compile-udm8xbcp/` (AEC disabled). These firmware sources match the AEC baseline, apart from substituted test credentials. The real target missing-PSRAM branch passed on pinned Espressif QEMU 9.2.2 (`esp_develop_9.2.2_20260417`), artifact `build/aec-target-abrdofw6/`; it returned the fallback status without allocating native DSP.
 
 With OPI PSRAM, the actual native AEC constructor reached Ready in QEMU, using 5,668 internal bytes and 121,512 PSRAM bytes including the wrapper's aligned buffers. This is an emulator allocation measurement, not a hardware runtime peak. The quality fixture stalled during the first DSP frame in the native HPS16 FFT instruction path, so **echo suppression, double-talk preservation, processing speed and processing-time heap stability are not verified**. Artifact `build/aec-target-u8mpq0jj/` records the failure and its no-progress timeout. The [standalone fixture](tests/aec_target/README.md) remains available for running on an actual ESP32-S3; the host wrapper tests do not substitute for this measurement.
 

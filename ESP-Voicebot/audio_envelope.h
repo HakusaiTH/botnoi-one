@@ -31,11 +31,13 @@ class Envelope {
     return config;
   }
 
-  Envelope() : config_(speakerDefaults()) {}
-  explicit Envelope(const Config& config) : config_(config) {}
+  Envelope() : Envelope(speakerDefaults()) {}
+  explicit Envelope(const Config& config)
+      : config_(config), attackRetention_(retention(config.attackMs)),
+        releaseRetention_(retention(config.releaseMs)) {}
 
   void reset() {
-    level_ = 0;
+    levelQ16_ = 0;
     target_ = 0;
     started_ = false;
     haveTarget_ = false;
@@ -43,8 +45,11 @@ class Envelope {
 
   // Feeds one block of mono PCM16 and returns the smoothed level.
   uint8_t push(uint32_t now, const int16_t* pcm, size_t samples) {
+    // Advance the old target first. A fresh block cannot retroactively keep an
+    // expired target alive, or act as if it played throughout a preceding gap.
+    step(now);
     if (pcm && samples) {
-      uint32_t sum = 0;
+      uint64_t sum = 0;
       for (size_t i = 0; i < samples; ++i) {
         const int32_t sample = pcm[i];  // Widened first: -32768 has no int16 magnitude.
         sum += static_cast<uint32_t>(sample < 0 ? -sample : sample);
@@ -52,15 +57,18 @@ class Envelope {
       target_ = scale(static_cast<uint32_t>(sum / samples));
       targetAt_ = now;
       haveTarget_ = true;
+      const uint32_t targetQ16 = static_cast<uint32_t>(target_) << 16;
+      const uint16_t span = targetQ16 > levelQ16_ ? config_.attackMs : config_.releaseMs;
+      if (!span) levelQ16_ = targetQ16;
     }
-    return step(now);
+    return level();
   }
 
   // Called by a producer that has no audio to submit. Without this the mouth
   // would hold the last block's amplitude through a gap between utterances.
   uint8_t decay(uint32_t now) { return step(now); }
 
-  uint8_t level() const { return level_; }
+  uint8_t level() const { return static_cast<uint8_t>((levelQ16_ + 32768u) >> 16); }
 
  private:
   uint8_t scale(uint32_t magnitude) const {
@@ -73,29 +81,54 @@ class Envelope {
     if (!started_) {
       started_ = true;
       lastAt_ = now;
-      return level_;
-    }
-    if (haveTarget_ && static_cast<uint32_t>(now - targetAt_) >= config_.holdMs) {
-      target_ = 0;
-      haveTarget_ = false;
+      return level();
     }
     const uint32_t elapsed = static_cast<uint32_t>(now - lastAt_);
+    if (haveTarget_) {
+      const uint32_t age = static_cast<uint32_t>(lastAt_ - targetAt_);
+      const uint32_t remainingHold = age < config_.holdMs ? config_.holdMs - age : 0;
+      if (elapsed >= remainingHold) {
+        advance(target_, remainingHold);
+        target_ = 0;
+        haveTarget_ = false;
+        advance(0, elapsed - remainingHold);
+      } else advance(target_, elapsed);
+    } else advance(0, elapsed);
     lastAt_ = now;
-    if (!elapsed || target_ == level_) return level_;
-    const uint16_t span = target_ > level_ ? config_.attackMs : config_.releaseMs;
-    // One step of `span` closes the whole remaining distance; repeated shorter
-    // steps close a fraction each, which is the usual exponential approach.
-    const uint32_t fraction = (!span || elapsed >= span) ? 255u : elapsed * 255u / span;
-    const uint32_t distance = target_ > level_ ? static_cast<uint32_t>(target_ - level_)
-                                              : static_cast<uint32_t>(level_ - target_);
-    // Rounding up guarantees progress, so a slow poll cannot stall the level.
-    const uint32_t move = (distance * fraction + 254u) / 255u;
-    level_ = static_cast<uint8_t>(target_ > level_ ? level_ + move : level_ - move);
-    return level_;
+    return level();
+  }
+
+  // One millisecond of exponential retention in Q24. Raising the same factor
+  // to elapsed time makes 20x1ms and 1x20ms follow the same curve. Q16 state
+  // retains sub-level progress instead of rounding every poll to a whole level.
+  // span/(span+1) is a bounded integer approximation of exp(-1/span).
+  static uint32_t retention(uint16_t span) {
+    return static_cast<uint32_t>((static_cast<uint64_t>(span) << 24) / (span + 1u));
+  }
+
+  static uint32_t power(uint32_t base, uint32_t exponent) {
+    uint32_t result = 1u << 24;
+    while (exponent) { // At most 32 iterations, including a long idle gap.
+      if (exponent & 1u) result = static_cast<uint32_t>((static_cast<uint64_t>(result) * base) >> 24);
+      exponent >>= 1;
+      if (exponent) base = static_cast<uint32_t>((static_cast<uint64_t>(base) * base) >> 24);
+    }
+    return result;
+  }
+
+  void advance(uint8_t target, uint32_t elapsed) {
+    const uint32_t targetQ16 = static_cast<uint32_t>(target) << 16;
+    if (!elapsed || targetQ16 == levelQ16_) return;
+    const bool rising = targetQ16 > levelQ16_;
+    const uint32_t distance = rising ? targetQ16 - levelQ16_ : levelQ16_ - targetQ16;
+    const uint32_t factor = power(rising ? attackRetention_ : releaseRetention_, elapsed);
+    const uint32_t remaining = static_cast<uint32_t>((static_cast<uint64_t>(distance) * factor) >> 24);
+    levelQ16_ = rising ? targetQ16 - remaining : targetQ16 + remaining;
   }
 
   Config config_;
-  uint8_t level_ = 0;
+  uint32_t attackRetention_, releaseRetention_;
+  uint32_t levelQ16_ = 0;
   uint8_t target_ = 0;
   bool started_ = false;
   bool haveTarget_ = false;

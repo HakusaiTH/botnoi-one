@@ -94,8 +94,8 @@
 #define VOICEBOT_DISPLAY_SPI_BUS HSPI
 #endif
 
-// 40 MHz is the ceiling for SPI pins routed through the GPIO matrix, which is
-// every pin above. Raising it requires the S3's dedicated IOMUX SPI pins.
+// 40 MHz is the reviewed default for this write-only panel and GPIO wiring.
+// Lower it for long wires or unstable pixels; validate changes on the hardware.
 #ifndef VOICEBOT_DISPLAY_SPI_HZ
 #define VOICEBOT_DISPLAY_SPI_HZ 40000000
 #endif

@@ -4,6 +4,7 @@
 Install Arduino CLI from https://docs.arduino.cc/arduino-cli/installation/.
 First run: python3 ESP-Voicebot/scripts/compile.py --install-deps
 Later:    python3 ESP-Voicebot/scripts/compile.py
+Audio-only: python3 ESP-Voicebot/scripts/compile.py --display off
 
 The default toolchain and all artifacts live in ignored ESP-Voicebot/build/.
 Use --arduino-cli and --config-file to reuse another CLI installation. This
@@ -68,6 +69,8 @@ def main():
     parser.add_argument("--target", choices=["all", *TARGETS], default="all")
     parser.add_argument("--aec", choices=["default", "on", "off"], default="default",
                         help="Use firmware default, or explicitly compile AEC on/off (dummy credentials remain enforced)")
+    parser.add_argument("--display", choices=["default", "on", "off"], default="default",
+                        help="Use firmware default, or explicitly compile the display on/off")
     parser.add_argument("--build-root", type=Path, help="Artifact and default isolated toolchain directory")
     parser.add_argument("--sketch", type=Path, default=Path(__file__).resolve().parents[1], help="Sketch source directory (for baseline comparisons)")
     args = parser.parse_args()
@@ -119,7 +122,7 @@ def main():
     stage_sketch(sketch, staged)
     summary = {
         "arduino_cli": cli_version, "esp32_core": CORE_VERSION, "arduinojson": JSON_VERSION,
-        "credentials": "dummy", "aec": args.aec, "targets": {},
+        "credentials": "dummy", "aec": args.aec, "display": args.display, "targets": {},
         "staged_source_sha256": {
             str(path.relative_to(staged)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(staged.rglob("*")) if path.is_file()
@@ -131,9 +134,13 @@ def main():
         log_path = artifact / f"{name}.log"
         compile_command = command + ["compile", "--fqbn", fqbn, "--warnings", "all",
                                      "--build-path", str(artifact / name)]
-        if args.aec != "default":
-            compile_command += ["--build-property", "compiler.cpp.extra_flags=-DVOICEBOT_AEC_ENABLED=" +
-                                ("1" if args.aec == "on" else "0")]
+        extra_flags = []
+        for choice, macro in ((args.aec, "VOICEBOT_AEC_ENABLED"),
+                              (args.display, "VOICEBOT_DISPLAY_ENABLED")):
+            if choice != "default":
+                extra_flags.append("-D" + macro + "=" + ("1" if choice == "on" else "0"))
+        if extra_flags:
+            compile_command += ["--build-property", "compiler.cpp.extra_flags=" + " ".join(extra_flags)]
         compile_command += [str(staged)]
         with log_path.open("w") as log:
             process = subprocess.Popen(compile_command, env=environment, stdout=subprocess.PIPE,

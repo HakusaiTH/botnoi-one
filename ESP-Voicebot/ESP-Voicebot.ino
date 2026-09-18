@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <atomic>
+#include <new>
 #include <time.h>
 #include <esp_heap_caps.h>
 #include <esp_psram.h>
@@ -62,7 +63,7 @@ std::atomic<uint32_t> playbackDrainedAt{0};
 std::atomic<bool> playbackDrainedValid{false};
 std::atomic<uint32_t> audioFault{0};
 std::atomic<bool> audioHealthy{true};
-// Face inputs. Only loop() writes the mood; only the audio tasks write the
+// Face inputs. Only loop() writes the mood; only the capture task writes the
 // levels. The render task reads all three and touches nothing else.
 std::atomic<uint8_t> faceMood{uint8_t(voicebot_face::Mood::Boot)};
 std::atomic<uint8_t> speakerFaceLevel{0}, microphoneFaceLevel{0};
@@ -72,7 +73,7 @@ voicebot_face::Envelope speakerEnvelope(voicebot_face::Envelope::speakerDefaults
 voicebot_face::Envelope microphoneEnvelope(voicebot_face::Envelope::microphoneDefaults());
 #if VOICEBOT_DISPLAY_ENABLED
 voicebot_face::FaceDisplay faceDisplay;
-SPIClass faceSpi(VOICEBOT_DISPLAY_SPI_BUS);
+SPIClass* faceSpi = nullptr;
 TaskHandle_t faceHandle = nullptr;
 #endif
 uint32_t bootedAt = 0;
@@ -209,14 +210,25 @@ void captureTask(void*) {
       }
     }
     if (!received) {
+#if VOICEBOT_DISPLAY_ENABLED
       microphoneFaceLevel.store(microphoneEnvelope.decay(now));
+      speakerFaceLevel.store(speakerEnvelope.decay(now));
+#endif
       if (now - lastCapture >= 500 || duplexAudio.invalidDmaEvents()) reportAudioFault(2);
       continue;  // Keep the physical Stop button usable after a hardware error.
     }
     lastCapture = now;
-    // Raw capture, before AEC: the listening face should react to the room even
-    // when the cleaned upload stream is mostly silence.
-    microphoneFaceLevel.store(microphoneEnvelope.push(now, block.mic, voicebot_audio::kDuplexSamples));
+#if VOICEBOT_DISPLAY_ENABLED
+    // DMA history contains what actually played, including silence and the
+    // cancellation tail. Staging submissions can precede playback by 70ms.
+    // Capture timestamps preserve the envelope cadence if this task wakes late.
+    if (block.discontinuity) {
+      microphoneEnvelope.reset();
+      speakerEnvelope.reset();
+    }
+    microphoneFaceLevel.store(microphoneEnvelope.push(block.capturedAtMillis, block.mic, voicebot_audio::kDuplexSamples));
+    speakerFaceLevel.store(speakerEnvelope.push(block.capturedAtMillis, block.reference, voicebot_audio::kDuplexSamples));
+#endif
     if (block.discontinuity) captureDiscontinuities.fetch_add(1);
     const uint32_t epoch = sessionEpoch.load();
     const bool upload = readEpoch == epoch && recordingEpoch.load() == epoch &&
@@ -278,9 +290,6 @@ void playbackTask(void*) {
     if (packetizer.full() || partialIdle) {
       const size_t submitted = packetizer.size();
       if (duplexAudio.submit(packetizer.data(), submitted, packetizer.generation())) {
-        // Measure the samples actually entering I2S, not the network arrival:
-        // with a 16-second speaker queue those differ by far more than a frame.
-        speakerFaceLevel.store(speakerEnvelope.push(millis(), packetizer.data(), submitted));
         // Driver accounting is visible before removing our buffered samples.
         packetizer.reset();
         playbackPartialSamples.store(0);
@@ -295,7 +304,6 @@ void playbackTask(void*) {
       const TickType_t wait = packetizer.size() ? pdMS_TO_TICKS(1) : pdMS_TO_TICKS(20);
       if (xQueueReceive(spkQueue, &frame, wait) != pdTRUE) {
         lastProgress = millis();
-        speakerFaceLevel.store(speakerEnvelope.decay(lastProgress));
         continue;
       }
       haveFrame = true;
@@ -348,16 +356,72 @@ voicebot_face::Mood faceMoodNow(uint32_t now) {
 
 #if VOICEBOT_DISPLAY_ENABLED
 void faceTask(void*) {
+  // setup() checks heap again after this task's stack/TCB are allocated, before
+  // permitting SPI access. Failed admission can then delete this task safely.
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   voicebot_face::FaceAnimator animator;
   animator.seed(esp_random());
   animator.reset(millis());
+  static_assert(VOICEBOT_DISPLAY_FRAME_MS > 0, "Display frame interval must be positive");
+  const TickType_t period = max(TickType_t(1), pdMS_TO_TICKS(VOICEBOT_DISPLAY_FRAME_MS));
+  TickType_t lastWake = xTaskGetTickCount();
   for (;;) {
     const voicebot_face::FaceFrame frame = animator.frame(millis(),
         static_cast<voicebot_face::Mood>(faceMood.load()),
         speakerFaceLevel.load(), microphoneFaceLevel.load());
     // Only changed regions reach SPI, so a talking mouth costs one window.
     faceDisplay.update(frame);
-    vTaskDelay(pdMS_TO_TICKS(VOICEBOT_DISPLAY_FRAME_MS));
+    if (xTaskDelayUntil(&lastWake, period) != pdTRUE) {
+      // A slow panel must yield even if a frame misses its target deadline.
+      lastWake = xTaskGetTickCount();
+      vTaskDelay(1);
+    }
+  }
+}
+
+void startFace() {
+  const int displayPins[] = {VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN,
+      VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
+      VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
+  const int audioPins[] = {1, 2, 3, 38, 39, 40, BUTTON_SESSION, LED_PIN};
+  for (int pin : displayPins) {
+    if (pin < 0) continue;
+    for (int reserved : audioPins) {
+      if (pin == reserved) {
+        Serial.println("[FACE] Display pin conflicts with audio/button/status LED; display disabled.");
+        return;
+      }
+    }
+  }
+  // Audio/AEC and Wi-Fi get their allocations first. Rendering is optional;
+  // account for its stack, TCB and SPI mutexes while retaining TLS headroom.
+  const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  if (heap_caps_get_free_size(caps) < INTERNAL_RESERVE + FACE_STACK_BYTES + 8192 ||
+      heap_caps_get_largest_free_block(caps) < TLS_LARGEST_BLOCK + FACE_STACK_BYTES) {
+    Serial.println("[FACE] Display skipped to preserve audio/TLS memory reserve.");
+    return;
+  }
+  faceSpi = new (std::nothrow) SPIClass(VOICEBOT_DISPLAY_SPI_BUS);
+  const voicebot_face::Ili9341::Pins facePins = {
+      VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN,
+      VOICEBOT_DISPLAY_CS_PIN, VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
+  if (faceSpi && faceDisplay.begin(facePins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ, *faceSpi) &&
+      xTaskCreate(faceTask, "face", FACE_STACK_BYTES, nullptr, 1, &faceHandle) == pdPASS &&
+      heap_caps_get_free_size(caps) >= INTERNAL_RESERVE &&
+      heap_caps_get_largest_free_block(caps) >= TLS_LARGEST_BLOCK) {
+    bootedAt = millis();
+    xTaskNotifyGive(faceHandle);
+    Serial.printf("[FACE] ILI9341 %dx%d at %uMHz; SCK=%d MOSI=%d DC=%d CS=%d RESET=%d LED=%d.\n",
+        int(faceDisplay.renderer().layout().width), int(faceDisplay.renderer().layout().height),
+        unsigned(VOICEBOT_DISPLAY_SPI_HZ / 1000000), VOICEBOT_DISPLAY_SCK_PIN,
+        VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
+        VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN);
+  } else {
+    if (faceHandle) { vTaskDelete(faceHandle); faceHandle = nullptr; }
+    faceDisplay.end();
+    delete faceSpi;
+    faceSpi = nullptr;
+    Serial.println("[FACE] Display unavailable or low memory; audio remains active.");
   }
 }
 #endif
@@ -394,25 +458,6 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   bootedAt = millis();
-#if VOICEBOT_DISPLAY_ENABLED
-  // Brought up before the audio allocations: an initialization failure below
-  // latches the Error face instead of leaving a blank screen. The panel needs
-  // no heap of its own, so it cannot take memory from AEC or TLS.
-  const voicebot_face::Ili9341::Pins facePins = {
-      VOICEBOT_DISPLAY_SCK_PIN, VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN,
-      VOICEBOT_DISPLAY_CS_PIN, VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN};
-  if (faceDisplay.begin(facePins, VOICEBOT_DISPLAY_ROTATION, VOICEBOT_DISPLAY_SPI_HZ, faceSpi) &&
-      xTaskCreate(faceTask, "face", FACE_STACK_BYTES, nullptr, 1, &faceHandle) == pdPASS) {
-    Serial.printf("[FACE] ILI9341 %dx%d at %uMHz; SCK=%d MOSI=%d DC=%d CS=%d RESET=%d LED=%d.\n",
-        int(faceDisplay.renderer().layout().width), int(faceDisplay.renderer().layout().height),
-        unsigned(VOICEBOT_DISPLAY_SPI_HZ / 1000000), VOICEBOT_DISPLAY_SCK_PIN,
-        VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
-        VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN);
-  } else {
-    faceDisplay.end();
-    Serial.println("[FACE] Display unavailable; the voicebot continues without the face.");
-  }
-#endif
   micQueue = makeAudioQueue(MIC_QUEUE_FRAMES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, &micQueueState, &micStorage);
   size_t speakerFrames = SPK_PSRAM_FRAMES;
   spkQueue = makeAudioQueue(speakerFrames, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, &spkQueueState, &spkStorage);
@@ -523,6 +568,9 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   ready = true;
+#if VOICEBOT_DISPLAY_ENABLED
+  startFace();
+#endif
   Serial.println("[SYSTEM] Ready. Tap the button to open a Voicebot session.");
   reportMemory();
 }

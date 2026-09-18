@@ -16,6 +16,7 @@ class FaceDisplay {
  public:
   bool begin(const Ili9341::Pins& pins, uint8_t rotation, uint32_t frequency, SPIClass& bus,
              const Layout& layout = Layout(), const Palette& palette = Palette()) {
+    end();
     renderer_ = FaceRenderer(layout, palette);
     if (!renderer_.valid()) return false;
     if (!panel_.begin(pins, rotation, frequency, bus)) return false;

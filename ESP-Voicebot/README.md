@@ -53,19 +53,21 @@ The face is a white screen with two black eyes and a pink mouth, driven by what 
 
 | Expression | When |
 | --- | --- |
-| Lids opening once | First 700 ms after boot |
+| Lids opening once | First 700 ms after the display starts |
 | Eyes scanning side to side | Wi-Fi, TLS or the Voicebot session is not usable yet |
 | Slow gaze drift, blinks, an occasional wink | No call requested |
 | Wide eyes lifting with your voice | Call open, microphone streaming |
 | Eyes looking up, small flat mouth | A final transcript arrived and no reply audio has started |
 | Mouth opening and closing with the reply | Reply audio is playing |
-| Squinted eyes and a frown | A latched audio/pipeline fault, or firmware that never reached ready |
+| Squinted eyes and a frown | An audio/pipeline fault after the display starts |
 
-The mouth follows an amplitude envelope measured **on the PCM entering I2S**, not on the PCM arriving from the network. With a 16-second speaker queue those two differ by far more than a frame, so measuring at the network would desynchronize the mouth from the sound by seconds. The listening reaction uses raw pre-AEC capture, so the face responds to the room even when the cleaned upload stream is near silence.
+The mouth follows **the actual completed speaker DMA audio**, including silence and the tail of cancelled playback. Both envelopes use the capture timeline, so a delayed task does not speed up the animation by processing several queued blocks at once. The listening reaction uses raw pre-AEC capture, so the face responds to the room even when the cleaned upload stream is near silence.
 
-Rendering runs in its own priority-1 task, below the priority-2 audio tasks, at about 30 frames per second. It rasterizes one row at a time into a single small buffer and pushes only the eye or mouth rectangles whose pixels actually changed: a talking mouth costs one SPI window of roughly 12 KB per frame, and a still face costs nothing. The face task never touches the socket, the audio queues or the heap. If the panel is absent or misconfigured, initialization logs `[FACE] Display unavailable` and the voicebot runs normally without it.
+Rendering runs in its own priority-1 task, below the priority-2 audio tasks, on a 33 ms schedule. It rasterizes one row at a time into a small buffer and pushes only changed eye or mouth rectangles; quantized-identical mouth shapes do not redraw. Rendering yields even when a frame misses its deadline. The face task never touches the socket, audio queues or heap. Invalid pins, a failed SPI start or insufficient memory disable the display while the voicebot continues.
 
-Display bring-up happens before the audio allocations, so a queue, I2S, or task failure shows the error face instead of a blank screen. The backlight stays off until a complete face has been drawn, so boot never shows the controller's uninitialized memory. Every 30 seconds `[FACE]` reports the current mood, both envelope levels and the render task's minimum unused stack.
+Display bring-up happens **after audio/AEC and Wi-Fi initialization**. Its SPI state and 4 KiB task stack require heap, so the firmware checks the audio/TLS reserve before allocating them and again before allowing the render task to run. A startup audio failure is reported over serial before a display is started. The backlight stays off until a complete face has been drawn. Every 30 seconds `[FACE]` reports the current mood, both envelope levels and the render task's minimum unused stack.
+
+This is a write-only SPI connection: a successful `[FACE] ILI9341 ...` log confirms initialization was sent, but cannot detect an unplugged panel. If the screen stays blank, check its supply, backlight, reset and pin wiring. The driver sends a complete five-byte power-control command and uses a software reset when no reset GPIO is configured, following the controller sequence in [Adafruit's ILI9341 driver](https://github.com/adafruit/Adafruit_ILI9341/blob/master/Adafruit_ILI9341.cpp).
 
 Application keepalives run every 20 seconds. A genuine network/upstream failure retries while Start remains active, with delays increasing from 1 to 30 seconds and small jitter. Recovery is explicitly logged as a **new server session**; the API does not document restoring conversation context after transport loss. Stop cancels recovery. Server completion, authorization rejection and invalid protocol messages end the call. A 60-second lack of incoming progress detects a stalled connection; deliberate speaker backpressure and ongoing inbound audio do not trigger that deadline.
 
@@ -105,6 +107,16 @@ python3 ESP-Voicebot/scripts/test_host.py --arduinojson /path/to/ArduinoJson/src
 ```
 
 Run commands from the repository root. `compile.py` pins dependencies, stages **dummy credentials**, builds both OPI-PSRAM and PSRAM-disabled variants, and saves logs, firmware and `summary.json` under ignored `ESP-Voicebot/build/`. Those dummy-credential binaries are compile artifacts; build your configured sketch in Arduino IDE for actual use. To reuse a CLI toolchain, pass `--arduino-cli` and `--config-file`.
+
+An existing pinned installation can be reused without another core download:
+
+```sh
+python3 ESP-Voicebot/scripts/compile.py --arduino-cli /path/to/arduino-cli --config-file /path/to/arduino-cli.yaml
+python3 ESP-Voicebot/scripts/compile.py --arduino-cli /path/to/arduino-cli --config-file /path/to/arduino-cli.yaml --display off --target opi
+python3 ESP-Voicebot/scripts/test_host.py --arduinojson /path/to/ArduinoJson/src
+```
+
+`--display default|on|off` selects display coverage independently of `--aec`. The host runner requires ArduinoJson for the client suite and runs all suites; an unchanged client still needs validation alongside new integration code.
 
 Host suites exercise the actual framing, capture/speaker packetizers, duplex callback timeline, playback/session helpers, real socket congestion, the mouth envelope, the face animation and rasterizer, and client logic with fake transport and real ArduinoJson, under AddressSanitizer and UndefinedBehaviorSanitizer. Wrapper doubles test AEC admission/cleanup policy; they do not establish echo-cancellation quality. The panel suite runs the real ILI9341 glue against recording Arduino/SPI doubles, checking the command stream, the pixel byte order and that only changed regions reach the bus; it cannot show that a physical panel lights up or that the face looks right on it. See [TROUBLESHOOTING_AND_FIXES.md](TROUBLESHOOTING_AND_FIXES.md) for measured results and hardware checks.
 
