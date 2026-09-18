@@ -35,10 +35,10 @@ class Ili9341 {
     if (!frequency || !validPins(pins)) return false;
     pins_ = pins;
     bus_ = &bus;
-    // Bring the controller up at a conservative clock even when the caller
-    // opts into faster pixel writes. A lost COLMOD/MADCTL byte corrupts every
-    // later frame; this setup runs only once, outside the animation loop.
-    settings_ = SPISettings(frequency < 1000000 ? frequency : 1000000, MSBFIRST, SPI_MODE0);
+    // Keep controller setup conservative even when pixels use a faster clock.
+    // A missed COLMOD/MADCTL parameter can corrupt every later frame.
+    controlSettings_ = SPISettings(frequency < 1000000 ? frequency : 1000000, MSBFIRST, SPI_MODE0);
+    settings_ = SPISettings(frequency, MSBFIRST, SPI_MODE0);
     pinMode(pins_.dc, OUTPUT);
     pinMode(pins_.cs, OUTPUT);
     digitalWrite(pins_.dc, HIGH);
@@ -68,7 +68,6 @@ class Ili9341 {
     delay(150);
     sendInitSequence();
     setRotation(rotation);
-    settings_ = SPISettings(frequency, MSBFIRST, SPI_MODE0);
     running_ = true;
     return true;
   }
@@ -105,8 +104,8 @@ class Ili9341 {
     }
   }
 
-  // Opens a write window and holds chip select for the following writeRow()
-  // calls, so one region costs a single SPI transaction.
+  // Restore orientation at the safe control clock, then hold chip select for
+  // the window and all writeRow() calls in one pixel transaction.
   void beginWindow(int16_t x, int16_t y, int16_t w, int16_t h) {
     if (!running_) return;
     const uint16_t lastX = static_cast<uint16_t>(x + w - 1);
@@ -115,6 +114,10 @@ class Ili9341 {
                                 static_cast<uint8_t>(lastX >> 8), static_cast<uint8_t>(lastX)};
     const uint8_t rows[4] = {static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(y),
                              static_cast<uint8_t>(lastY >> 8), static_cast<uint8_t>(lastY)};
+    // With no MISO readback a missed startup MADCTL write is undetectable.
+    // Reassert it before CASET/PASET, including the first full-screen clear,
+    // so landscape coordinates cannot keep using stale portrait addressing.
+    send(0x36, &madctl_, 1);
     bus_->beginTransaction(settings_);
     digitalWrite(pins_.cs, LOW);
     write(0x2A, columns, 4);  // CASET
@@ -173,7 +176,7 @@ class Ili9341 {
   }
 
   void send(uint8_t command, const uint8_t* data, size_t length) {
-    bus_->beginTransaction(settings_);
+    bus_->beginTransaction(controlSettings_);
     digitalWrite(pins_.cs, LOW);
     write(command, data, length);
     digitalWrite(pins_.cs, HIGH);
@@ -184,8 +187,8 @@ class Ili9341 {
     // MADCTL, BGR panels. Odd rotations swap the axes into landscape.
     static const uint8_t kMadctl[4] = {0x48, 0x28, 0x88, 0xE8};
     const uint8_t index = static_cast<uint8_t>(rotation & 0x03);
-    const uint8_t value = kMadctl[index];
-    send(0x36, &value, 1);
+    madctl_ = kMadctl[index];
+    send(0x36, &madctl_, 1);
     const bool landscape = (index & 1) != 0;
     width_ = landscape ? 320 : 240;
     height_ = landscape ? 240 : 320;
@@ -236,10 +239,12 @@ class Ili9341 {
 
   Pins pins_ = {-1, -1, -1, -1, -1, -1};
   SPIClass* bus_ = nullptr;
+  SPISettings controlSettings_;
   SPISettings settings_;
   alignas(4) uint16_t swap_[kMaxSpanPixels] = {};
   int16_t width_ = 320;
   int16_t height_ = 240;
+  uint8_t madctl_ = 0x28;
   bool running_ = false;
 };
 

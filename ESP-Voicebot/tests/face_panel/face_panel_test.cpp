@@ -114,7 +114,10 @@ static void configured_goouuu_pins_pass_the_project_guard_and_initialize_the_pan
   const Ili9341::Pins pins = configuredWiring();
   assert(pins.sck == 3 && pins.backlight == -1);
   assert(VOICEBOT_DISPLAY_SPI_HZ == 10000000);
-  assert(voicebot_hardware::kMicrophoneBclk == 42);
+  assert(VOICEBOT_DISPLAY_ROTATION == 1);
+  assert(voicebot_hardware::kMicrophoneBclk == 48);
+  assert(VOICEBOT_BUTTON_PIN == 46);
+  assert(voicebot_hardware::kStatusLed == 13);
   // GPIO3 used to be the microphone clock. Reserving it after the I2S move
   // disabled the display before SPI initialization, leaving a white screen.
   assert(!voicebot_hardware::audioUsesPin(pins.sck));
@@ -152,7 +155,7 @@ static void every_active_audio_button_and_status_pin_is_rejected_before_hardware
     }
   }
   // The MAX98357A still receives the shared clocks through GPIO-matrix
-  // outputs 38/39, even though the primary I2S clock GPIOs are 42/2.
+  // outputs 38/39, even though the primary I2S clock GPIOs are 48/2.
   assert(audioUsesPin(kSpeakerBclk) && audioUsesPin(kSpeakerWs));
 }
 
@@ -236,7 +239,8 @@ static void initialization_is_slow_complete_and_settled_before_fast_pixels() {
     }
     const size_t before = bus.transactionSettings.size();
     panel.fill(0, 0, 1, 1, 0xF800);
-    assert(bus.transactionSettings.size() == before + 1);
+    assert(bus.transactionSettings.size() == before + 2);
+    assert(bus.transactionSettings[before].frequency == expectedInitFrequency);
     assert(bus.transactionSettings.back().frequency == frequency);
     assert(bus.transactionTimes.back() - commandTime(bus, 0x29) >= 150);
     panel.end();
@@ -362,6 +366,74 @@ static void rotation_selects_the_madctl_value_and_the_axis_order() {
   }
 }
 
+static void window_addresses_recover_when_the_startup_rotation_write_is_lost() {
+  const uint8_t expected[4] = {0x48, 0x28, 0x88, 0xE8};
+  for (uint8_t rotation = 0; rotation < 4; ++rotation) {
+    arduino_stub::clear();
+    SPIClass bus(HSPI);
+    Ili9341 panel;
+    assert(panel.begin(wiring(), rotation, 10000000, bus));
+    panel.fill(0, 0, panel.width(), panel.height(), 0xFFFF);
+    // Exercise the last physical rows/columns, including x=319 in landscape.
+    panel.fill(panel.width() - 2, panel.height() - 2, 2, 2, 0xF800);
+
+    // Replay the address commands as a panel left in its power-on portrait
+    // mode after losing the initial MADCTL write. ILI9341 sections 8.2.20/21
+    // limit CASET to 239 without MV, or 319 with MV; PASET has the other bound.
+    // Reject out-of-range writes instead of assuming the software dimensions
+    // prove the controller received the orientation.
+    uint8_t madctl = 0;
+    unsigned rotationWrites = 0;
+    uint16_t x = 0, y = 0, lastX = 239, lastY = 319;
+    std::vector<Rect> windows;
+    size_t start = 0;
+    while (start < bus.bytes.size()) {
+      assert(levelAtByte(bus, start, kDc) == LOW);
+      size_t end = start + 1;
+      while (end < bus.bytes.size() && levelAtByte(bus, end, kDc) == HIGH) ++end;
+      const size_t length = end - start - 1;
+      const uint8_t command = bus.bytes[start];
+      const uint8_t* payload = bus.bytes.data() + start + 1;
+      if (command == 0x36) {
+        assert(length == 1);
+        if (rotationWrites++ != 0) madctl = payload[0];  // Drop startup write.
+        // Each retry must retain the conservative clock used at startup.
+        bool found = false;
+        for (size_t i = 0; i < bus.transactionByteStarts.size(); ++i) {
+          if (bus.transactionByteStarts[i] != start) continue;
+          assert(bus.transactionSettings[i].frequency == 1000000);
+          found = true;
+          break;
+        }
+        assert(found);
+      } else if (command == 0x2A || command == 0x2B) {
+        assert(length == 4 && madctl == expected[rotation]);
+        const uint16_t first = static_cast<uint16_t>((payload[0] << 8) | payload[1]);
+        const uint16_t last = static_cast<uint16_t>((payload[2] << 8) | payload[3]);
+        const bool landscape = (madctl & 0x20) != 0;
+        const uint16_t limit = command == 0x2A ? (landscape ? 319 : 239)
+                                                : (landscape ? 239 : 319);
+        assert(first <= last && last <= limit);
+        if (command == 0x2A) { x = first; lastX = last; }
+        else { y = first; lastY = last; }
+      } else if (command == 0x2C) {
+        const uint16_t width = static_cast<uint16_t>(lastX - x + 1);
+        const uint16_t height = static_cast<uint16_t>(lastY - y + 1);
+        assert(length == static_cast<size_t>(width) * height * 2);
+        windows.push_back({static_cast<int16_t>(x), static_cast<int16_t>(y),
+                           static_cast<int16_t>(width), static_cast<int16_t>(height)});
+      }
+      start = end;
+    }
+    assert(rotationWrites == 3 && windows.size() == 2);
+    assert(windows[0].x == 0 && windows[0].y == 0);
+    assert(windows[0].w == panel.width() && windows[0].h == panel.height());
+    assert(windows[1].x == panel.width() - 2 && windows[1].y == panel.height() - 2);
+    assert(windows[1].w == 2 && windows[1].h == 2);
+    panel.end();
+  }
+}
+
 static void a_window_write_sends_exact_bounds_and_big_endian_pixels() {
   arduino_stub::clear();
   SPIClass bus(HSPI);
@@ -374,8 +446,9 @@ static void a_window_write_sends_exact_bounds_and_big_endian_pixels() {
   panel.writeRow(row, 4);
   panel.writeRow(row, 4);
   panel.endWindow();
-  // CASET 10..13, PASET 20..21, RAMWR, then the pixels.
-  const std::vector<uint8_t> expected{0x2A, 0x00, 0x0A, 0x00, 0x0D,
+  // Restore landscape, CASET 10..13, PASET 20..21, RAMWR, then the pixels.
+  const std::vector<uint8_t> expected{0x36, 0x28,
+                                      0x2A, 0x00, 0x0A, 0x00, 0x0D,
                                       0x2B, 0x00, 0x14, 0x00, 0x15,
                                       0x2C,
                                       0x00, 0x00, 0xFF, 0xFF, 0xF8, 0x00, 0x00, 0x1F,
@@ -383,11 +456,13 @@ static void a_window_write_sends_exact_bounds_and_big_endian_pixels() {
   assert(bus.bytes == expected);
   for (size_t index = 0; index < expected.size(); ++index) {
     assert(levelAtByte(bus, index, kCs) == LOW);
-    const bool isCommand = index == 0 || index == 5 || index == 10;
+    const bool isCommand = index == 0 || index == 2 || index == 7 || index == 12;
     assert(levelAtByte(bus, index, kDc) == (isCommand ? LOW : HIGH));
   }
-  // One region costs exactly one transaction and one chip-select assertion.
-  assert(bus.transactions == transactionsBefore + 1);
+  // One safe-clock orientation transaction, then one pixel transaction.
+  assert(bus.transactions == transactionsBefore + 2);
+  assert(bus.transactionSettings[transactionsBefore].frequency == 1000000);
+  assert(bus.transactionSettings[transactionsBefore + 1].frequency == 40000000);
   assert(arduino_stub::levelOf(kCs) == HIGH);
   panel.end();
 }
@@ -407,10 +482,10 @@ static void odd_and_maximum_rows_use_safe_bulk_storage_without_extra_wire_pixels
     panel.beginWindow(0, 0, static_cast<int16_t>(count), 1);
     panel.writeRow(row, count);
     panel.endWindow();
-    assert(bus.bytes.size() == 11 + count * 2);
+    assert(bus.bytes.size() == 13 + count * 2);
     for (size_t index = 0; index < count; ++index) {
-      assert(bus.bytes[11 + index * 2] == static_cast<uint8_t>(row[index] >> 8));
-      assert(bus.bytes[12 + index * 2] == static_cast<uint8_t>(row[index]));
+      assert(bus.bytes[13 + index * 2] == static_cast<uint8_t>(row[index] >> 8));
+      assert(bus.bytes[14 + index * 2] == static_cast<uint8_t>(row[index]));
     }
   }
   panel.end();
@@ -424,8 +499,8 @@ static void fill_covers_every_pixel_of_the_rectangle() {
   bus.bytes.clear();
   panel.fill(0, 0, 320, 240, 0xFFFF);
   // Address bytes plus 320 * 240 pixels of two bytes each.
-  assert(bus.bytes.size() == 11u + 320u * 240u * 2u);
-  for (size_t i = 11; i < bus.bytes.size(); ++i) assert(bus.bytes[i] == 0xFF);
+  assert(bus.bytes.size() == 13u + 320u * 240u * 2u);
+  for (size_t i = 13; i < bus.bytes.size(); ++i) assert(bus.bytes[i] == 0xFF);
   // A zero or negative rectangle is a no-op rather than a runaway window.
   bus.bytes.clear();
   panel.fill(0, 0, 0, 10, 0);
@@ -450,8 +525,8 @@ static void the_first_face_paints_everything_and_lights_the_backlight() {
     const Rect rect = renderer.region(index);
     pixels += static_cast<size_t>(rect.w) * static_cast<size_t>(rect.h);
   }
-  // Every region, plus 11 address bytes each.
-  assert(bus.bytes.size() == pixels * 2 + FaceRenderer::kRegionCount * 11);
+  // Every region, plus orientation and 11 address bytes each.
+  assert(bus.bytes.size() == pixels * 2 + FaceRenderer::kRegionCount * 13);
   display.end();
 }
 
@@ -476,7 +551,7 @@ static void only_changed_regions_reach_the_bus() {
   bus.bytes.clear();
   display.update(frame);
   assert(bus.bytes.size() ==
-         static_cast<size_t>(mouth.w) * static_cast<size_t>(mouth.h) * 2 + 11);
+         static_cast<size_t>(mouth.w) * static_cast<size_t>(mouth.h) * 2 + 13);
 
   // A wink redraws one eye only.
   const Rect right = renderer.region(FaceRenderer::kRightEye);
@@ -484,7 +559,7 @@ static void only_changed_regions_reach_the_bus() {
   bus.bytes.clear();
   display.update(frame);
   assert(bus.bytes.size() ==
-         static_cast<size_t>(right.w) * static_cast<size_t>(right.h) * 2 + 11);
+         static_cast<size_t>(right.w) * static_cast<size_t>(right.h) * 2 + 13);
 
   // Gaze moves both eyes and leaves the mouth alone.
   const Rect left = renderer.region(FaceRenderer::kLeftEye);
@@ -492,7 +567,7 @@ static void only_changed_regions_reach_the_bus() {
   bus.bytes.clear();
   display.update(frame);
   assert(bus.bytes.size() ==
-         (static_cast<size_t>(left.w) * left.h + static_cast<size_t>(right.w) * right.h) * 2 + 22);
+         (static_cast<size_t>(left.w) * left.h + static_cast<size_t>(right.w) * right.h) * 2 + 26);
   display.end();
   // Updates after end() must be dropped, not sent to a closed bus.
   bus.bytes.clear();
@@ -545,6 +620,7 @@ int main() {
   absent_reset_pin_uses_software_reset_and_waits_before_configuration();
   begin_resets_the_panel_and_holds_the_backlight_dark();
   rotation_selects_the_madctl_value_and_the_axis_order();
+  window_addresses_recover_when_the_startup_rotation_write_is_lost();
   a_window_write_sends_exact_bounds_and_big_endian_pixels();
   odd_and_maximum_rows_use_safe_bulk_storage_without_extra_wire_pixels();
   fill_covers_every_pixel_of_the_rectangle();

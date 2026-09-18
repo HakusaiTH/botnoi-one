@@ -30,10 +30,10 @@
 #define BOTNOI_WS_PORT 443
 #endif
 
-// External session button to GND. The expansion board's KEY/BOOT is GPIO0;
-// GPIO4 is also camera SCCB data, so do not use that camera with this button.
+// External session button to GND, using INPUT_PULLUP. Leave TFT SDO/MISO
+// disconnected: GPIO46 is reserved for this button. KEY/BOOT remains GPIO0.
 #ifndef VOICEBOT_BUTTON_PIN
-#define VOICEBOT_BUTTON_PIN 4
+#define VOICEBOT_BUTTON_PIN 46
 #endif
 
 // Native ESP-SR full-duplex echo cancellation. Requires ESP32-S3 with working
@@ -84,7 +84,8 @@
 #define VOICEBOT_DISPLAY_BACKLIGHT_PIN -1
 #endif
 
-// Rotations 1 and 3 are landscape; 3 flips a panel mounted upside down.
+// The face needs 320x240 landscape: 1 is the default, 3 flips it by 180 degrees.
+// Update any old config.local.h override too; portrait (0/2) cannot fit the face.
 #ifndef VOICEBOT_DISPLAY_ROTATION
 #define VOICEBOT_DISPLAY_ROTATION 1
 #endif

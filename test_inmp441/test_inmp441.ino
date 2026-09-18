@@ -1,6 +1,6 @@
 // Test Sketch for INMP441 Microphone (ESP32-S3)
 // Pin Mapping:
-// - SCK / BCLK : GPIO 3
+// - SCK / BCLK : GPIO 48 (matches ESP-Voicebot)
 // - WS / LRCLK : GPIO 2
 // - DOUT / SD  : GPIO 1
 // Note: Connect INMP441 L/R pin to GND to select Left Channel.
@@ -8,7 +8,7 @@
 #include <Arduino.h>
 #include <ESP_I2S.h>
 
-constexpr int MIC_SCK = 3;
+constexpr int MIC_SCK = 48;
 constexpr int MIC_WS  = 2;
 constexpr int MIC_SD  = 1;
 constexpr uint32_t SAMPLE_RATE = 16000;

@@ -24,6 +24,8 @@
 #include "face_state.h"
 #if VOICEBOT_DISPLAY_ENABLED
 #include "face_display.h"
+static_assert(VOICEBOT_DISPLAY_ROTATION == 1 || VOICEBOT_DISPLAY_ROTATION == 3,
+              "The face requires landscape: set VOICEBOT_DISPLAY_ROTATION to 1 or 3 in config.local.h.");
 #endif
 #include "voicebot_client.h"
 #include "tls_roots.h"
@@ -407,11 +409,12 @@ void startFace() {
       heap_caps_get_largest_free_block(caps) >= TLS_LARGEST_BLOCK) {
     bootedAt = millis();
     xTaskNotifyGive(faceHandle);
-    Serial.printf("[FACE] ILI9341 %dx%d at %uMHz; SCK=%d MOSI=%d DC=%d CS=%d RESET=%d LED=%d.\n",
+    Serial.printf("[FACE] ILI9341 %dx%d at %uMHz; SCK=%d MOSI=%d DC=%d CS=%d RESET=%d LED=%d; landscape rotation=%u.\n",
         int(faceDisplay.renderer().layout().width), int(faceDisplay.renderer().layout().height),
         unsigned(VOICEBOT_DISPLAY_SPI_HZ / 1000000), VOICEBOT_DISPLAY_SCK_PIN,
         VOICEBOT_DISPLAY_MOSI_PIN, VOICEBOT_DISPLAY_DC_PIN, VOICEBOT_DISPLAY_CS_PIN,
-        VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN);
+        VOICEBOT_DISPLAY_RESET_PIN, VOICEBOT_DISPLAY_BACKLIGHT_PIN,
+        unsigned(VOICEBOT_DISPLAY_ROTATION));
   } else {
     if (faceHandle) { vTaskDelete(faceHandle); faceHandle = nullptr; }
     faceDisplay.end();
@@ -453,6 +456,9 @@ void setup() {
   pinMode(BUTTON_SESSION, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  Serial.printf("[PINS] INMP441 SCK=%d WS=%d SD=%d; BUTTON=%d; STATUS_LED=%d.\n",
+      voicebot_hardware::kMicrophoneBclk, voicebot_hardware::kMicrophoneWs,
+      voicebot_hardware::kMicrophoneData, BUTTON_SESSION, LED_PIN);
   bootedAt = millis();
   micQueue = makeAudioQueue(MIC_QUEUE_FRAMES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, &micQueueState, &micStorage);
   size_t speakerFrames = SPK_PSRAM_FRAMES;

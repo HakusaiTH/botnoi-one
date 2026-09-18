@@ -43,8 +43,9 @@ The active firmware uses the TFT and audio wiring below. It does not initialize 
 
 # 3. TFT Display Pinout
 
-The 2.8-inch TFT display uses an SPI interface. This signal map matches the
+The 2.8-inch TFT display uses an SPI interface. The active output pins follow the
 [GOOUUU expansion-board reference](https://github.com/profharris/GOOUUU-Tech-ESP32-S3-CAM-Expansion-Board#lcd-28in-240320-spi-tft-display-ili9341).
+The unused SDO connection is removed to reserve GPIO46 for the session button.
 That community guide does not establish the exact revision of an individual board or panel.
 
 | TFT Pin | ESP32-S3 GPIO | Function |
@@ -53,7 +54,7 @@ That community guide does not establish the exact revision of an individual boar
 | GND | GND | Ground |
 | SCK | GPIO3 | SPI Clock |
 | SDI / MOSI | GPIO45 | SPI Data |
-| SDO / MISO | GPIO46 | SPI Data |
+| SDO / MISO | Not connected | Unused; GPIO46 is the session button |
 | DC | GPIO47 | Data / Command |
 | RESET | GPIO21 | Display Reset |
 | CS | GPIO14 | Chip Select |
@@ -64,7 +65,7 @@ That community guide does not establish the exact revision of an individual boar
 ```text
 TFT SCK   -> GPIO3
 TFT MOSI  -> GPIO45
-TFT MISO  -> GPIO46
+TFT MISO  -> Not connected (GPIO46 is the session button)
 TFT DC    -> GPIO47
 TFT RESET -> GPIO21
 TFT CS    -> GPIO14
@@ -73,7 +74,8 @@ TFT LED   -> 3.3V
 
 The backlight is permanently powered, so a white screen only establishes that
 it is lit. The firmware must also initialize the controller and draw the face.
-MISO is not read by the current display driver.
+MISO is not read by the current display driver. Disconnect/isolate any TFT SDO
+connection to GPIO46 so it cannot share the session-button input.
 
 The driver initializes the controller at **1 MHz**, including a software reset,
 then uses **10 MHz** for pixel writes by default. The ILI9341 specification requires
@@ -85,16 +87,16 @@ a minimum 100 ns serial write-clock period, corresponding to 10 MHz; the old
 
 | Device | Signal | GPIO |
 |---|---|---:|
-| INMP441 | BCLK / SCK | 42 |
+| INMP441 | BCLK / SCK | 48 |
 | INMP441 | WS / LRCLK | 2 |
 | INMP441 | DOUT / SD | 1 |
 | MAX98357A | BCLK | 38 |
 | MAX98357A | LRC | 39 |
 | MAX98357A | DIN | 40 |
-| Session button to GND | Signal | 4 |
-| External status LED with series resistor | Anode | 48 |
+| Session button to GND | Signal | 46 |
+| External status LED with series resistor | Anode | 13 |
 
-GPIO42 is the microphone clock; GPIO3 belongs to the TFT clock. The audio
+GPIO48 is the microphone clock; GPIO3 belongs to the TFT clock. The audio
 driver and display conflict check both use `hardware_pins.h`. GPIO38 and
 GPIO39 remain active amplifier clock outputs and cannot be reused by the TFT.
 
@@ -103,11 +105,13 @@ GPIO39 remain active amplifier clock outputs and cannot be reused by the TFT.
 On the [referenced expansion board](https://github.com/profharris/GOOUUU-Tech-ESP32-S3-CAM-Expansion-Board#misc-pin-connectionsconfigurations):
 
 - Open/remove **P7** (potentiometer on GPIO1) and **P8** (DHT11 on GPIO2) before using the microphone.
-- Do not use an OLED on GPIO42 or the onboard SD socket on GPIO38–40 simultaneously with this audio wiring.
-- The session button on **GPIO4 is external**. The built-in **KEY/BOOT button uses GPIO0**. GPIO4 also connects to camera SCCB/SIOD, so camera operation and this external button cannot be enabled together.
+- Do not use the onboard SD socket on GPIO38–40 simultaneously with this audio wiring.
+- The session button on **GPIO46 is external**, connects to GND when pressed, and uses the internal pull-up after startup. Disconnect the TFT SDO/MISO signal from this pin. The built-in **KEY/BOOT button uses GPIO0**.
+- GPIO46 is a boot strapping pin: serial download mode needs it low or floating at reset; normal boot with GPIO0 high ignores it. Avoid adding an external pull-up that holds it high during firmware download. [Espressif boot-mode reference](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/advanced-topics/boot-mode-selection.html#gpio46).
 
 The touch controller's T_CS, T_DIN and T_CLK inputs connect to GPIO1, GPIO2 and
-GPIO42. These are input connections, so the overlap alone does not prove output
+GPIO42. GPIO1 and GPIO2 still overlap the microphone data/WS signals; GPIO42 is
+no longer its clock. These are input connections, so the overlap alone does not prove output
 contention. Touch is unsupported with this audio pin map. During troubleshooting,
 isolate unused touch signals where the wiring permits; do not drive GPIO1 high
 to disable touch, because it carries microphone data.
@@ -119,23 +123,29 @@ revision, update its display/button definitions to these values while retaining
 your existing credentials:
 
 ```cpp
-#define VOICEBOT_BUTTON_PIN 4
+#define VOICEBOT_BUTTON_PIN 46
 #define VOICEBOT_DISPLAY_SCK_PIN 3
 #define VOICEBOT_DISPLAY_MOSI_PIN 45
 #define VOICEBOT_DISPLAY_DC_PIN 47
 #define VOICEBOT_DISPLAY_CS_PIN 14
 #define VOICEBOT_DISPLAY_RESET_PIN 21
 #define VOICEBOT_DISPLAY_BACKLIGHT_PIN -1
+#define VOICEBOT_DISPLAY_ROTATION 1
 #define VOICEBOT_DISPLAY_SPI_HZ 10000000
 ```
 
-In particular, replace any old `VOICEBOT_DISPLAY_SPI_HZ 40000000` override;
-updating `config.example.h` does not override an existing local definition.
+Replace old button/rotation definitions and any `VOICEBOT_DISPLAY_SPI_HZ 40000000`
+override; updating `config.example.h` does not override an existing local definition.
+The face requires **320×240 landscape**: rotation `1` is the default, and `3`
+flips it by 180 degrees. Portrait values `0`/`2` fail the main firmware build with
+an explanatory message. Microphone SCK is GPIO48 and status LED is GPIO13 in
+`hardware_pins.h`; reconnect those two wires as well.
 
 After uploading, the expected initialization log at 115200 baud is:
 
 ```text
-[FACE] ILI9341 320x240 at 10MHz; SCK=3 MOSI=45 DC=47 CS=14 RESET=21 LED=-1.
+[PINS] INMP441 SCK=48 WS=2 SD=1; BUTTON=46; STATUS_LED=13.
+[FACE] ILI9341 320x240 at 10MHz; SCK=3 MOSI=45 DC=47 CS=14 RESET=21 LED=-1; landscape rotation=1.
 ```
 
 The older GPIO3 audio reservation caused the display to be skipped before SPI

@@ -33,7 +33,7 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 
 ## Checks on the board
 
-1. Confirm the exact module, flash and PSRAM mode. The default pin map targets ESP32-S3 N16R8 and needs **OPI PSRAM** for voice barge-in. `PSRAM free=0` means this capability is unavailable; a disabled/failed PSRAM configuration uses a small internal speaker queue and explicit half-duplex fallback. Match [hardware_pinout.md](hardware_pinout.md), including GPIO4 for the session button, and update old `config.local.h` overrides.
+1. Confirm the exact module, flash and PSRAM mode. The default pin map targets ESP32-S3 N16R8 and needs **OPI PSRAM** for voice barge-in. `PSRAM free=0` means this capability is unavailable; a disabled/failed PSRAM configuration uses a small internal speaker queue and explicit half-duplex fallback. Match [hardware_pinout.md](hardware_pinout.md): microphone SCK GPIO48, session button GPIO46 and status LED GPIO13. Leave TFT SDO disconnected and update old `config.local.h` overrides.
 2. Capture boot logs at 115200 baud. Queue allocation, duplex I2S and both tasks must succeed. For voice barge-in, require `[AEC] AEC ready` and `[MIC] Echo-cancelled full duplex`. Inspect the reported native heap delta. The socket must remain closed at `[SYSTEM] Ready`; tap once and verify `[SESSION] Ready` appears only after verified TLS and a valid `opened` event.
 3. Let the complete greeting play, then speak several turns without touching the button. Verify each response uses the same session id/context and begins promptly after server end-of-utterance detection. Tap once more only to hang up; the log should show the protocol close before transport shutdown.
 4. With AEC ready, interrupt long replies at normal speaking volume and at several distances/angles. Repeat with quiet speech, loud playback and simultaneous speech. Barge-in must stop queued playback, keep the session, preserve the interruption's words and preserve the next reply. Confirm the bot's own voice does not trigger false interruptions. Measure mic/reference FIFO alignment and tune the finished enclosure if needed; a digital reference cannot correct amplifier clipping or mechanical vibration by itself.
@@ -64,6 +64,14 @@ Updated 2026-09-18. These notes describe the current implementation and distingu
 
 The supplied photo does not identify a unique cause. The linked board reference agrees with the configured ILI9341 signals, and host checks exercise RGB565 byte order, complete frame clearing and command/data boundaries. Those checks cannot establish signal integrity, panel identity or supply stability.
 
+For a face that stays portrait with a clipped/striped right eye and an uncleared
+bottom strip, check `VOICEBOT_DISPLAY_ROTATION 1` (or `3` for reversed landscape)
+in any local configuration. The renderer needs 320×240, and the main sketch now
+rejects portrait overrides at compile time. The driver also reasserts MADCTL at
+at most 1 MHz before every drawing window. This addresses a potentially missed
+orientation command; the photograph alone does not prove that was the cause.
+Confirm the result on the actual panel after uploading.
+
 Update existing `config.local.h` overrides to `VOICEBOT_DISPLAY_SPI_HZ 10000000`; old local values still override the new default. If noise remains, use the [display-only diagnostic](tests/display_target/README.md) at its 1 MHz default. It cycles labelled solid colours and patterns with no microphone, speaker or Wi-Fi initialization. This also bypasses the production audio-startup/memory guards that can intentionally skip the display.
 
 If the isolated pattern is still wrong at 1 MHz, verify the physical pin names, controller, reset, shared ground and supply against [hardware_pinout.md](hardware_pinout.md). If it is clean alone but fails with the voicebot, compare the same SPI speed and investigate the documented expansion-board peripheral overlaps and power under audio load. No automatic test result can be inferred from successful SPI writes without readback.
@@ -73,6 +81,20 @@ Clock reference: ILI9341 specification, section 18.3.4, [four-line SPI timing, p
 ## Validation scope
 
 The repository includes reproducible Arduino builds for PSRAM enabled/disabled, sanitizer-backed host tests and a standalone actual ESP-SR DSP fixture. The current changes have not been flashed to a connected ESP32 in this session. The ILI9341 face has **not** run on a physical panel: its host suites cover the animation, the rasterized pixels, the command stream and the byte order, but rotation, colour order, backlight wiring, SPI timing margin and the visual result are unmeasured. Hardware audio quality, runtime TLS peaks, power stability, echo behavior and long-session context remain to be measured on the actual device. The supplied log shows application-triggered session reconnections with available internal RAM; it does not contain a boot banner, panic or reset cause establishing an ESP32 reboot.
+
+### New pins and landscape retry validated on 2026-09-18
+
+The active map is microphone SCK GPIO48, session button GPIO46, and status LED
+GPIO13. TFT SDO is disconnected from GPIO46. The face remains 320×240 landscape,
+and the driver retries its selected MADCTL value before each drawing window.
+
+All **15 host suites** pass with AddressSanitizer/UndefinedBehaviorSanitizer.
+The new panel regression drops the startup rotation command and verifies full
+screen and bottom-right writes in all four driver rotations; it fails against
+the previous driver. Main firmware builds pass with ESP32 core 3.3.11 and
+ArduinoJson 7.4.3 for both OPI PSRAM and PSRAM disabled, with no compiler warnings.
+The local build record is `build/compile-f_aka1_b/summary.json`; credentials are
+dummy values and neither binary has been uploaded to a board.
 
 ### SPI timing and display diagnostic validated on 2026-09-18
 

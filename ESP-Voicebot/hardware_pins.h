@@ -7,13 +7,13 @@
 // screen blocked by an obsolete microphone pin.
 namespace voicebot_hardware {
 
-constexpr int kMicrophoneBclk = 42;
+constexpr int kMicrophoneBclk = 48;
 constexpr int kMicrophoneWs = 2;
 constexpr int kMicrophoneData = 1;
 constexpr int kSpeakerBclk = 38;
 constexpr int kSpeakerWs = 39;
 constexpr int kSpeakerData = 40;
-constexpr int kStatusLed = 48;
+constexpr int kStatusLed = 13;
 
 constexpr bool audioUsesPin(int pin) {
   return pin == kMicrophoneBclk || pin == kMicrophoneWs ||

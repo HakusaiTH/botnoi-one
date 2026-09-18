@@ -6,21 +6,21 @@ The supported target is **ESP32-S3**. Smart-speaker voice barge-in uses Espressi
 
 ## Hardware
 
-The current wiring follows [hardware_pinout.md](hardware_pinout.md) for the GOOUUU ESP32-S3-CAM V1.5. Its TFT signal map matches the [GOOUUU expansion-board reference](https://github.com/profharris/GOOUUU-Tech-ESP32-S3-CAM-Expansion-Board#lcd-28in-240320-spi-tft-display-ili9341). Audio pins are shared between the I2S driver and display conflict checks through `hardware_pins.h`.
+The current wiring follows [hardware_pinout.md](hardware_pinout.md) for the GOOUUU ESP32-S3-CAM V1.5. Its TFT output pins follow the [GOOUUU expansion-board reference](https://github.com/profharris/GOOUUU-Tech-ESP32-S3-CAM-Expansion-Board#lcd-28in-240320-spi-tft-display-ili9341); the unused SDO connection is removed for the session button. Audio pins are shared between the I2S driver and display conflict checks through `hardware_pins.h`.
 
 | Device | Signal | ESP32-S3 GPIO |
 | --- | --- | ---: |
-| INMP441 | BCLK / SCK | 42 |
+| INMP441 | BCLK / SCK | 48 |
 | INMP441 | WS / LRCLK | 2 |
 | INMP441 | DOUT / SD | 1 |
 | MAX98357A | BCLK | 38 |
 | MAX98357A | LRC | 39 |
 | MAX98357A | DIN | 40 |
-| External LED, with series resistor | Anode | 48 |
-| Session button, other side to GND | Signal | 4 |
+| External LED, with series resistor | Anode | 13 |
+| Session button, other side to GND | Signal | 46 |
 | ILI9341 panel | SCK / CLK | 3 |
 | ILI9341 panel | MOSI / SDI | 45 |
-| ILI9341 panel | MISO / SDO | 46 |
+| ILI9341 panel | MISO / SDO | Not connected |
 | ILI9341 panel | DC / RS | 47 |
 | ILI9341 panel | CS | 14 |
 | ILI9341 panel | RESET | 21 |
@@ -28,13 +28,13 @@ The current wiring follows [hardware_pinout.md](hardware_pinout.md) for the GOOU
 
 Tie INMP441 L/R to GND for the left slot. Use a common ground and suitable power supply for the amplifier. The LED code expects an ordinary external LED, not an addressable RGB LED.
 
-The panel's MISO (GPIO46) and touch pins are not needed for display driving; the firmware never reads the controller and does not support touch with this audio wiring. The expansion board may still connect these signals physically. Every display pin is configurable in `config.local.h`, and `VOICEBOT_DISPLAY_ENABLED 0` builds audio-only firmware.
+Leave the panel's **MISO / SDO disconnected from GPIO46**, which now belongs to the session button. The display is write-only and does not need MISO. If the expansion board connects SDO to GPIO46, isolate that connection before using the button. Touch is unsupported with this audio wiring. Every display pin is configurable in `config.local.h`, and `VOICEBOT_DISPLAY_ENABLED 0` builds audio-only firmware.
 
 **GPIO45 is a strapping pin** (VDD_SPI voltage select) sampled at reset; it is an ordinary output afterwards, but do not add an external pull resistor to it. If your panel's RESET is tied to the board's reset line, set `VOICEBOT_DISPLAY_RESET_PIN -1`.
 
 **The backlight is connected to 3.3V** (`VOICEBOT_DISPLAY_BACKLIGHT_PIN -1`). The face comes up already lit. If driving backlight via GPIO, ensure the module does not exceed the pin's rated continuous current. [Espressif ESP32-S3 pin documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
 
-GPIO4 is the **external** session button (`VOICEBOT_BUTTON_PIN 4`); the expansion board's built-in KEY/BOOT button uses GPIO0. GPIO4 also connects to camera SCCB/SIOD, so the camera remains unused. Open expansion jumpers **P7/P8** for microphone operation, and do not use the OLED/SD peripherals that share audio pins. See the [shared-peripheral checklist](hardware_pinout.md#5-expansion-board-peripherals-sharing-these-pins), including the unused touch connections.
+GPIO46 is the **external** session button (`VOICEBOT_BUTTON_PIN 46`), configured with the internal pull-up and pressed by connecting to GND; the expansion board's built-in KEY/BOOT button uses GPIO0. Open expansion jumpers **P7/P8** for microphone operation, and do not use the SD peripheral that shares amplifier pins. See the [shared-peripheral checklist](hardware_pinout.md#5-expansion-board-peripherals-sharing-these-pins), including the unused touch connections.
 
 ## Build and run
 
@@ -72,7 +72,9 @@ Display bring-up happens **after audio/AEC and Wi-Fi initialization**. Its SPI s
 
 The driver initializes at **1 MHz** and writes pixels at **10 MHz** by default. The ILI9341 specifies a minimum 100 ns serial write-clock period, equivalent to 10 MHz; 40 MHz exceeds that published timing. [ILI9341 datasheet, section 18.3.4](https://www.displayfuture.com/Display/datasheet/controller/ILI9341.pdf#page=238).
 
-If upgrading, update the display/button overrides in `config.local.h` as shown in [hardware_pinout.md](hardware_pinout.md#6-updating-an-existing-local-configuration), including **`VOICEBOT_DISPLAY_SPI_HZ 10000000`**. Existing local definitions take precedence over updated defaults. Expect `[FACE] ILI9341 320x240 at 10MHz; ...`; a conflict log includes the exact GPIO.
+The face uses **320×240 landscape** (`VOICEBOT_DISPLAY_ROTATION 1`); use `3` for the opposite landscape direction. A portrait override (`0` or `2`) now produces a compile-time message instead of leaving the face disabled. The driver reasserts the selected rotation at at most 1 MHz before every drawing window, including the initial full-screen clear, so a missed startup rotation command does not remain the only orientation write.
+
+If upgrading, update the display/button overrides in `config.local.h` as shown in [hardware_pinout.md](hardware_pinout.md#6-updating-an-existing-local-configuration), including **`VOICEBOT_BUTTON_PIN 46`**, **`VOICEBOT_DISPLAY_ROTATION 1`** and **`VOICEBOT_DISPLAY_SPI_HZ 10000000`**. Existing local definitions take precedence over updated defaults. Microphone SCK and status LED come from `hardware_pins.h` and are now GPIO48 and GPIO13. Expect `[PINS] INMP441 SCK=48 WS=2 SD=1; BUTTON=46; STATUS_LED=13.` and `[FACE] ILI9341 320x240 at 10MHz; ...; landscape rotation=1.`; a conflict log includes the exact GPIO.
 
 This is a write-only SPI connection: a successful `[FACE] ILI9341 ...` log confirms initialization was sent, but cannot detect an unplugged panel. A photo of snowy pixels alone cannot distinguish timing, wiring, reset, supply or controller problems. The extended register setup follows [Adafruit's ILI9341 driver](https://github.com/adafruit/Adafruit_ILI9341/blob/master/Adafruit_ILI9341.cpp). The firmware also performs a software reset even when a reset GPIO is configured. These changes need confirmation on the physical panel.
 
