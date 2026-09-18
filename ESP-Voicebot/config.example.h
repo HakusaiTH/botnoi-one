@@ -30,9 +30,9 @@
 #define BOTNOI_WS_PORT 443
 #endif
 
-// GPIO4 active-low session button (Released -> HIGH, Pressed -> LOW).
+// GPIO46 active-low session button (Released -> HIGH, Pressed -> LOW).
 #ifndef VOICEBOT_BUTTON_PIN
-#define VOICEBOT_BUTTON_PIN 4
+#define VOICEBOT_BUTTON_PIN 46
 #endif
 
 // Native ESP-SR full-duplex echo cancellation. Requires ESP32-S3 with working
