@@ -17,7 +17,7 @@ using voicebot_face::Rect;
 
 namespace {
 
-const int8_t kSck = 42, kMosi = 41, kDc = 45, kCs = 47, kReset = 14, kBacklight = 21;
+const int8_t kSck = 3, kMosi = 45, kDc = 47, kCs = 14, kReset = 21, kBacklight = -1;
 
 Ili9341::Pins wiring() {
   const Ili9341::Pins pins = {kSck, kMosi, kDc, kCs, kReset, kBacklight};

@@ -30,10 +30,9 @@
 #define BOTNOI_WS_PORT 443
 #endif
 
-// GPIO46 preserves the existing wiring. It is an ESP32-S3 boot strapping pin;
-// see README before adding an external pull resistor. GPIO4 is an alternative.
+// GPIO4 is the talk button pin for GOOUUU ESP32-S3-CAM.
 #ifndef VOICEBOT_BUTTON_PIN
-#define VOICEBOT_BUTTON_PIN 46
+#define VOICEBOT_BUTTON_PIN 4
 #endif
 
 // Native ESP-SR full-duplex echo cancellation. Requires ESP32-S3 with working
@@ -58,30 +57,30 @@
 #endif
 
 #ifndef VOICEBOT_DISPLAY_SCK_PIN
-#define VOICEBOT_DISPLAY_SCK_PIN 42
+#define VOICEBOT_DISPLAY_SCK_PIN 3
 #endif
 
 #ifndef VOICEBOT_DISPLAY_MOSI_PIN
-#define VOICEBOT_DISPLAY_MOSI_PIN 41
+#define VOICEBOT_DISPLAY_MOSI_PIN 45
 #endif
 
 #ifndef VOICEBOT_DISPLAY_DC_PIN
-#define VOICEBOT_DISPLAY_DC_PIN 45
+#define VOICEBOT_DISPLAY_DC_PIN 47
 #endif
 
 #ifndef VOICEBOT_DISPLAY_CS_PIN
-#define VOICEBOT_DISPLAY_CS_PIN 47
+#define VOICEBOT_DISPLAY_CS_PIN 14
 #endif
 
 // Set to -1 when the panel's RESET is tied to the board's own reset line.
 #ifndef VOICEBOT_DISPLAY_RESET_PIN
-#define VOICEBOT_DISPLAY_RESET_PIN 14
+#define VOICEBOT_DISPLAY_RESET_PIN 21
 #endif
 
 // Set to -1 when LED is wired permanently on. A GPIO cannot safely source the
 // backlight current of every module; see README before driving it directly.
 #ifndef VOICEBOT_DISPLAY_BACKLIGHT_PIN
-#define VOICEBOT_DISPLAY_BACKLIGHT_PIN 21
+#define VOICEBOT_DISPLAY_BACKLIGHT_PIN -1
 #endif
 
 // Rotations 1 and 3 are landscape; 3 flips a panel mounted upside down.

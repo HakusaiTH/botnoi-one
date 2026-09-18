@@ -49,7 +49,7 @@ class DuplexAudio {
     config.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000);
     config.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
     config.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-    config.gpio_cfg.bclk = GPIO_NUM_3;
+    config.gpio_cfg.bclk = GPIO_NUM_42;
     config.gpio_cfg.ws = GPIO_NUM_2;
     config.gpio_cfg.dout = GPIO_NUM_40;
     config.gpio_cfg.din = GPIO_NUM_1;

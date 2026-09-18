@@ -8,30 +8,31 @@ The supported target is **ESP32-S3**. Smart-speaker voice barge-in uses Espressi
 
 | Device | Signal | ESP32-S3 GPIO |
 | --- | --- | ---: |
-| INMP441 | BCLK / SCK | 3 |
+| INMP441 | BCLK / SCK | 42 |
 | INMP441 | WS / LRCLK | 2 |
 | INMP441 | DOUT / SD | 1 |
 | MAX98357A | BCLK | 38 |
 | MAX98357A | LRC | 39 |
 | MAX98357A | DIN | 40 |
 | External LED, with series resistor | Anode | 48 |
-| Session button, other side to GND | Signal | 46 |
-| ILI9341 panel | SCK / CLK | 42 |
-| ILI9341 panel | MOSI / SDI | 41 |
-| ILI9341 panel | DC / RS | 45 |
-| ILI9341 panel | CS | 47 |
-| ILI9341 panel | RESET | 14 |
-| ILI9341 panel | LED / BL | 21 |
+| Session button, other side to GND | Signal | 4 |
+| ILI9341 panel | SCK / CLK | 3 |
+| ILI9341 panel | MOSI / SDI | 45 |
+| ILI9341 panel | MISO / SDO | 46 |
+| ILI9341 panel | DC / RS | 47 |
+| ILI9341 panel | CS | 14 |
+| ILI9341 panel | RESET | 21 |
+| ILI9341 panel | LED / BL | 3.3V |
 
 Tie INMP441 L/R to GND for the left slot. Use a common ground and suitable power supply for the amplifier. The LED code expects an ordinary external LED, not an addressable RGB LED.
 
-The panel's MISO and touch pins are left unconnected; the firmware never reads the controller and does not use the touch function. Every display pin is configurable in `config.local.h`, and `VOICEBOT_DISPLAY_ENABLED 0` builds audio-only firmware.
+The panel's MISO (GPIO46) and touch pins are optional/unconnected for display driving; the firmware never reads the controller and does not use the touch function. Every display pin is configurable in `config.local.h`, and `VOICEBOT_DISPLAY_ENABLED 0` builds audio-only firmware.
 
-Three display pins need checking against your board before you rely on this map. **GPIO41 and GPIO42 are the ESP32-S3 JTAG MTDI/MTMS pins**, so hardware JTAG debugging is unavailable while the panel is wired; USB-serial flashing and the serial monitor are unaffected. **GPIO45 is a strapping pin** (VDD_SPI voltage select) sampled at reset; it is an ordinary output afterwards, but do not add an external pull resistor to it. If your panel's RESET is tied to the board's reset line, set `VOICEBOT_DISPLAY_RESET_PIN -1`.
+**GPIO45 is a strapping pin** (VDD_SPI voltage select) sampled at reset; it is an ordinary output afterwards, but do not add an external pull resistor to it. If your panel's RESET is tied to the board's reset line, set `VOICEBOT_DISPLAY_RESET_PIN -1`.
 
-**The backlight is the one connection to get right.** Many 2.8" modules draw more current on LED than an ESP32-S3 pin should source. Either switch it with a small NPN/MOSFET driven from GPIO21, or wire LED to a current-limited 3.3 V supply and set `VOICEBOT_DISPLAY_BACKLIGHT_PIN -1`; the face then simply comes up already lit. Driving the LED pin directly from a GPIO is common in hobby wiring but is outside the pin's rated continuous current on some modules. [Espressif ESP32-S3 pin documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
+**The backlight is connected to 3.3V** (`VOICEBOT_DISPLAY_BACKLIGHT_PIN -1`). The face comes up already lit. If driving backlight via GPIO, ensure the module does not exceed the pin's rated continuous current. [Espressif ESP32-S3 pin documentation](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/gpio.html).
 
-GPIO46 is a boot strapping pin. Preserve the existing wiring if it works; for a new design, GPIO4 is a convenient talk-button alternative: set `VOICEBOT_BUTTON_PIN 4` in `config.local.h`. Do not add a pull-up on GPIO46 without checking the board's boot/download requirements. [Espressif boot-mode documentation](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/advanced-topics/boot-mode-selection.html).
+GPIO4 is configured for the session talk-button (`VOICEBOT_BUTTON_PIN 4`).
 
 ## Build and run
 
